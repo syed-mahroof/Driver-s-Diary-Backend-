@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import Driver, Company, Ride, Attendance, PasswordResetOTP, CarCharge
+from .models import Driver, Company, Ride, Attendance, PasswordResetOTP, CarCharge, Vehicle, AdvanceSalaryRequest
 
 
 @admin.register(Driver)
@@ -47,3 +47,17 @@ class CarChargeAdmin(admin.ModelAdmin):
     search_fields = ['driver__name', 'app_used', 'place']
     date_hierarchy = 'date'
 
+
+@admin.register(Vehicle)
+class VehicleAdmin(admin.ModelAdmin):
+    list_display = ['number', 'seater', 'is_active', 'created_at']
+    list_filter = ['seater', 'is_active']
+    search_fields = ['number']
+
+
+@admin.register(AdvanceSalaryRequest)
+class AdvanceSalaryRequestAdmin(admin.ModelAdmin):
+    list_display = ['driver', 'amount', 'status', 'request_date', 'resolved_date']
+    list_filter = ['status', 'request_date']
+    search_fields = ['driver__name']
+    date_hierarchy = 'request_date'
