@@ -117,3 +117,12 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 FULL_DAY_RATE = float(os.environ.get('FULL_DAY_RATE', '1000'))
 HALF_DAY_RATE = float(os.environ.get('HALF_DAY_RATE', '500'))
 FULL_DAY_THRESHOLD = int(os.environ.get('FULL_DAY_THRESHOLD', '4'))
+
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.smtp.EmailBackend')
+# EMAIL_FILE_PATH removed as we are using SMTP
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS = os.environ.get('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER = os.environ.get('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.environ.get('EMAIL_HOST_PASSWORD', '')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@driversdiary.com')

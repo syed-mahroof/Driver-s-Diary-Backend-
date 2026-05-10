@@ -10,6 +10,7 @@ from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
+from django.core.mail import send_mail
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -84,7 +85,7 @@ def forgot_password(request):
 
     if not user:
         return Response(
-            {'error': 'No account found with this phone number or email.'},
+            {'error': 'No account found with this email address.'},
             status=status.HTTP_404_NOT_FOUND
         )
 
@@ -95,21 +96,56 @@ def forgot_password(request):
     otp_code = f"{random.randint(100000, 999999)}"
     PasswordResetOTP.objects.create(user=user, otp=otp_code)
 
-    # Print OTP to console (replace with email/SMS in production)
-    print(f"\n{'='*50}")
-    print(f"  PASSWORD RESET OTP for {user.username}")
-    print(f"  Contact: {contact}")
-    print(f"  OTP: {otp_code}")
-    print(f"{'='*50}\n")
-
     # Determine which method was used
     is_email = '@' in contact
     masked = _mask_contact(contact, is_email)
 
+    if is_email:
+        subject = "Driver's Diary - Password Reset OTP"
+        message = f"Hello {user.username},\n\nYour OTP for password reset is: {otp_code}\n\nPlease do not share this OTP with anyone.\n\nThank you,\nDriver's Diary Team"
+        html_message = f"""
+        <html>
+            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+                    <h2 style="color: #2E7D32; text-align: center;">Driver's Diary</h2>
+                    <p>Hello <strong>{user.username}</strong>,</p>
+                    <p>We received a request to reset your password. Your One-Time Password (OTP) is:</p>
+                    <div style="background-color: #f4f4f4; padding: 15px; text-align: center; font-size: 24px; letter-spacing: 5px; font-weight: bold; border-radius: 5px; margin: 20px 0;">
+                        {otp_code}
+                    </div>
+                    <p style="color: #d32f2f; font-size: 0.9em;">Please do not share this OTP with anyone. It is valid for a limited time.</p>
+                    <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+                    <p style="font-size: 0.8em; color: #777;">Thank you,<br>Driver's Diary Team</p>
+                </div>
+            </body>
+        </html>
+        """
+        try:
+            send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL if hasattr(settings, 'DEFAULT_FROM_EMAIL') else 'noreply@driversdiary.com',
+                [contact],
+                fail_silently=False,
+                html_message=html_message
+            )
+        except Exception as e:
+            print(f"Error sending email: {e}")
+            import traceback
+            traceback.print_exc()
+            return Response(
+                {'error': f'Failed to send email. Error: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    else:
+        # If it's a phone number, logic for sending SMS would go here.
+        # Since the user requested to send to email, and the form now only accepts email, 
+        # this path is unlikely, but we keep it for fallback.
+        print(f"  PASSWORD RESET OTP for {user.username}: {otp_code}")
+
     return Response({
         'message': f'OTP sent to {masked}',
         'contact_type': 'email' if is_email else 'phone',
-        'dev_otp': otp_code,
     })
 
 
@@ -359,7 +395,7 @@ def admin_dashboard(request):
     if company_id:
         ride_qs = ride_qs.filter(company_id=company_id)
 
-    stats = attendance_qs.aggregate(
+    stats_agg = attendance_qs.aggregate(
         total_half_days=Count('id', filter=Q(status='Half')),
         total_full_days=Count('id', filter=Q(status='Full')),
         total_salary=Sum('salary'),
@@ -376,15 +412,43 @@ def admin_dashboard(request):
     total_advance_paid = sum(float(a.amount) for a in paid_advances)
     advance_paid_drivers = list(set(a.driver.name for a in paid_advances))
 
+    # Company breakdown
+    company_stats = ride_qs.values('company__name').annotate(
+        count=Count('id'),
+        total_km=Sum('total_km')
+    ).order_by('-count')
+    
+    company_breakdown = []
+    for item in company_stats:
+        company_breakdown.append({
+            'name': item['company__name'] or 'Other',
+            'count': item['count'],
+            'total_km': float(item['total_km'] or 0)
+        })
+
+    # Charging stats
+    charge_qs = CarCharge.objects.all()
+    if start_date: charge_qs = charge_qs.filter(date__gte=start_date)
+    if end_date: charge_qs = charge_qs.filter(date__lte=end_date)
+    if driver_id: charge_qs = charge_qs.filter(driver_id=driver_id)
+    total_charging_cost = float(charge_qs.aggregate(total=Sum('charge_amount'))['total'] or 0)
+
+    # Drivers target achieved (count drivers who have at least one 'Full' day in the period)
+    drivers_target_achieved = attendance_qs.filter(status='Full').values('driver').distinct().count()
+    total_active_drivers = Driver.objects.filter(is_active=True).count()
+
     return Response({
         'total_rides': ride_qs.count(),
-        'total_drivers': Driver.objects.filter(is_active=True).count(),
-        'total_half_days': stats['total_half_days'] or 0,
-        'total_full_days': stats['total_full_days'] or 0,
-        'total_salary_paid': stats['total_salary'] or 0,
+        'total_drivers': total_active_drivers,
+        'drivers_target_achieved': drivers_target_achieved,
+        'total_half_days': stats_agg['total_half_days'] or 0,
+        'total_full_days': stats_agg['total_full_days'] or 0,
+        'total_salary_paid': stats_agg['total_salary'] or 0,
         'pending_advance_count': pending_advance_count,
         'total_advance_paid': total_advance_paid,
         'advance_paid_drivers': advance_paid_drivers,
+        'company_breakdown': company_breakdown,
+        'total_charging_cost': total_charging_cost,
     })
 
 

@@ -31,7 +31,7 @@ class DriverSerializer(serializers.ModelSerializer):
 
 class RegisterSerializer(serializers.Serializer):
     username = serializers.CharField(max_length=150)
-    email = serializers.EmailField(required=False, allow_blank=True)
+    email = serializers.EmailField(required=True)
     password = serializers.CharField(write_only=True, min_length=6)
     name = serializers.CharField(max_length=200)
     phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
@@ -41,13 +41,13 @@ class RegisterSerializer(serializers.Serializer):
             raise serializers.ValidationError('Username is already taken.')
         return value
 
+    def validate_email(self, value):
+        value = value.strip()
+        if User.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError('An account with this email already exists.')
+        return value
+
     def validate(self, data):
-        phone = data.get('phone', '').strip()
-        email = data.get('email', '').strip()
-        if not phone and not email:
-            raise serializers.ValidationError(
-                {'non_field_errors': ['At least one of phone number or email is required.']}
-            )
         return data
 
     @transaction.atomic
