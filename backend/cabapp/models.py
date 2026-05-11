@@ -50,6 +50,7 @@ class Ride(models.Model):
     notes = models.TextField(blank=True)
     total_km = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
     vehicle_number = models.CharField(max_length=50, blank=True)
+    requested_seater = models.IntegerField(default=4)
     created_at = models.DateTimeField(auto_now_add=True)
     synced_at = models.DateTimeField(auto_now_add=True)
 

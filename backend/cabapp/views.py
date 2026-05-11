@@ -219,8 +219,8 @@ def driver_dashboard(request):
 
     today = date.today()
     threshold = getattr(settings, 'FULL_DAY_THRESHOLD', 4)
-    full_rate = getattr(settings, 'FULL_DAY_RATE', 800)
-    half_rate = getattr(settings, 'HALF_DAY_RATE', 400)
+    full_rate = getattr(settings, 'FULL_DAY_RATE', 1000)
+    half_rate = getattr(settings, 'HALF_DAY_RATE', 500)
 
     today_rides_qs = Ride.objects.filter(driver=driver, date=today)
     today_count = today_rides_qs.count()

@@ -79,7 +79,7 @@ class RideSerializer(serializers.ModelSerializer):
         model = Ride
         fields = ['id', 'local_id', 'driver', 'driver_name', 'company', 'company_name',
                   'date', 'ride_time', 'trip_type', 'route', 'pickup', 'drop',
-                  'notes', 'total_km', 'vehicle_number', 'created_at']
+                  'notes', 'total_km', 'vehicle_number', 'requested_seater', 'created_at']
         read_only_fields = ['id', 'created_at']
 
 
@@ -87,7 +87,7 @@ class RideCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Ride
         fields = ['local_id', 'company', 'date', 'ride_time', 'trip_type', 'route',
-                  'pickup', 'drop', 'notes', 'total_km', 'vehicle_number']
+                  'pickup', 'drop', 'notes', 'total_km', 'vehicle_number', 'requested_seater']
         extra_kwargs = {
             'pickup': {'required': False, 'allow_blank': True},
             'drop': {'required': False, 'allow_blank': True},
@@ -112,6 +112,7 @@ class SyncRideSerializer(serializers.Serializer):
     notes = serializers.CharField(required=False, allow_blank=True)
     total_km = serializers.DecimalField(max_digits=7, decimal_places=2, required=False, allow_null=True)
     vehicle_number = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    requested_seater = serializers.IntegerField(required=False, default=4)
 
 
 class SyncPayloadSerializer(serializers.Serializer):
