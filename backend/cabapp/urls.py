@@ -18,6 +18,7 @@ urlpatterns = [
     path('driver/charge/', views.create_car_charge, name='create_car_charge'),
     path('driver/update-default-vehicle/', views.update_default_vehicle, name='update_default_vehicle'),
     path('rides/', views.create_ride, name='create_ride'),
+    path('rides/<int:pk>/update/', views.update_ride, name='update_ride'),
     path('sync-rides/', views.sync_rides, name='sync_rides'),
     path('companies/', views.list_companies, name='list_companies'),
 

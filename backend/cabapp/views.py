@@ -269,6 +269,33 @@ def create_ride(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+@api_view(['PATCH', 'PUT'])
+@permission_classes([IsAuthenticated])
+def update_ride(request, pk):
+    try:
+        driver = request.user.driver_profile
+        ride = Ride.objects.get(pk=pk, driver=driver)
+    except Driver.DoesNotExist:
+        return Response({'error': 'Driver profile not found'}, status=404)
+    except Ride.DoesNotExist:
+        return Response({'error': 'Ride not found'}, status=404)
+
+    old_date = ride.date
+    serializer = RideCreateSerializer(ride, data=request.data, partial=True, context={'request': request})
+    if serializer.is_valid():
+        updated_ride = serializer.save()
+
+        # Update attendance for the old date if it changed
+        if old_date != updated_ride.date:
+            update_attendance(driver, old_date)
+
+        # Always update attendance for the (new) date
+        update_attendance(driver, updated_ride.date)
+
+        return Response(RideSerializer(updated_ride).data)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_car_charge(request):
