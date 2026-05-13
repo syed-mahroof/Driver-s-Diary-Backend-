@@ -405,10 +405,17 @@ def admin_dashboard(request):
     advance_qs = AdvanceSalaryRequest.objects.select_related('driver').all()
     if driver_id:
         advance_qs = advance_qs.filter(driver_id=driver_id)
+    
+    # Notification count should show all pending requests for visibility
     pending_advance_count = advance_qs.filter(status='Pending').count()
 
-    # Paid advances with driver names
+    # Stats for the quick overview should respect the date filter
     paid_advances = advance_qs.filter(status='Paid')
+    if start_date:
+        paid_advances = paid_advances.filter(resolved_date__date__gte=start_date)
+    if end_date:
+        paid_advances = paid_advances.filter(resolved_date__date__lte=end_date)
+    
     total_advance_paid = sum(float(a.amount) for a in paid_advances)
     advance_paid_drivers = list(set(a.driver.name for a in paid_advances))
 
@@ -551,8 +558,8 @@ def export_excel(request):
     # Fetch advance salary requests (Paid) for the period
     advance_qs_all = AdvanceSalaryRequest.objects.filter(
         status='Paid',
-        request_date__date__gte=d_start,
-        request_date__date__lte=d_end,
+        resolved_date__date__gte=d_start,
+        resolved_date__date__lte=d_end,
     )
     if driver_id:
         advance_qs_all = advance_qs_all.filter(driver_id=driver_id)
