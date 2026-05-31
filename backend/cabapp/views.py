@@ -1,7 +1,7 @@
 from datetime import date, datetime, timedelta
 import random
 from django.db import transaction
-from django.db.models import Count, Sum, Q
+from django.db.models import Count, Sum, Q, Case, When, Value, IntegerField
 from django.http import HttpResponse
 from django.conf import settings
 from rest_framework import status, generics
@@ -840,6 +840,77 @@ def export_excel(request):
         col_widths_a = [15, 20, 20, 14, 30, 15, 15]
         for i, width in enumerate(col_widths_a, 1):
             wsall.column_dimensions[get_column_letter(i)].width = width
+
+    # Consolidated All Rides Sheet (all drivers, all rides in one sheet)
+    all_rides_qs = Ride.objects.select_related('company', 'driver').filter(
+        date__gte=d_start, date__lte=d_end
+    )
+    if driver_id:
+        all_rides_qs = all_rides_qs.filter(driver_id=driver_id)
+    if company_id:
+        all_rides_qs = all_rides_qs.filter(company_id=company_id)
+
+    all_rides_list = list(all_rides_qs.annotate(
+        trip_type_order=Case(
+            When(trip_type='P', then=Value(0)),
+            When(trip_type='D', then=Value(1)),
+            default=Value(2),
+            output_field=IntegerField(),
+        )
+    ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
+
+    if all_rides_list:
+        rides_fill = PatternFill(start_color='1B5E20', end_color='1B5E20', fill_type='solid')
+        wsr = wb.create_sheet(title="All Rides", index=0)
+
+        # Title
+        wsr.merge_cells('A1:I1')
+        title_cell_r = wsr['A1']
+        title_cell_r.value = "Consolidated Rides - All Drivers"
+        title_cell_r.font = Font(bold=True, size=14, color='FFFFFF')
+        title_cell_r.fill = rides_fill
+        title_cell_r.alignment = center_align
+
+        # Headers
+        rides_headers = ['Date', 'Driver Name', 'Client', 'P/D', 'Time', 'Route', 'Total km', 'Vehicle', 'Amount']
+        for col, header in enumerate(rides_headers, 1):
+            cell = wsr.cell(row=2, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = border
+
+        row_idx_r = 3
+        total_rides_all = 0
+        for ride in all_rides_list:
+            route = ride.route or f"{ride.pickup} to {ride.drop}"
+            data = [
+                ride.date.strftime('%d-%m-%Y'),
+                ride.driver.name,
+                ride.company.name if ride.company else '',
+                ride.trip_type,
+                ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else '',
+                route,
+                float(ride.total_km) if ride.total_km is not None else '',
+                ride.vehicle_number or '',
+                '',
+            ]
+            for col, val in enumerate(data, 1):
+                cell = wsr.cell(row=row_idx_r, column=col, value=val)
+                cell.alignment = center_align if col != 6 else Alignment(horizontal='left')
+                cell.border = border
+            total_rides_all += 1
+            row_idx_r += 1
+
+        # Total row
+        row_idx_r += 1
+        wsr.cell(row=row_idx_r, column=1, value='TOTAL RIDES').font = Font(bold=True)
+        wsr.cell(row=row_idx_r, column=3, value=total_rides_all).font = Font(bold=True)
+
+        # Column widths
+        col_widths_r = [15, 22, 20, 8, 14, 34, 12, 14, 14]
+        for i, width in enumerate(col_widths_r, 1):
+            wsr.column_dimensions[get_column_letter(i)].width = width
 
     if not target_drivers:
         ws = wb.active
