@@ -34,6 +34,7 @@ urlpatterns = [
     path('companies/create/', views.create_company, name='create_company'),
     path('reports/', views.reports, name='reports'),
     path('export-excel/', views.export_excel, name='export_excel'),
+    path('export-monthly-report/', views.export_monthly_report, name='export_monthly_report'),
     path('vehicles/', views.list_vehicles, name='list_vehicles'),
     path('vehicles/create/', views.create_vehicle, name='create_vehicle'),
 ]

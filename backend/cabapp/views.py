@@ -467,6 +467,17 @@ def admin_dashboard(request):
     if driver_id: charge_qs = charge_qs.filter(driver_id=driver_id)
     total_charging_cost = float(charge_qs.aggregate(total=Sum('charge_amount'))['total'] or 0)
 
+    charge_list = [{
+        'id': c.id,
+        'driver_name': c.driver.name,
+        'date': c.date.strftime('%Y-%m-%d'),
+        'app_used': c.app_used,
+        'time': c.time.strftime('%I:%M %p').lstrip('0') if c.time else '',
+        'place': c.place,
+        'vehicle_number': c.vehicle_number,
+        'charge_amount': float(c.charge_amount),
+    } for c in charge_qs.select_related('driver').order_by('-date', '-time')]
+
     # Drivers target achieved (count drivers who have at least one 'Full' day in the period)
     drivers_target_achieved = attendance_qs.filter(status='Full').values('driver').distinct().count()
     total_active_drivers = Driver.objects.filter(is_active=True).count()
@@ -483,6 +494,7 @@ def admin_dashboard(request):
         'advance_paid_drivers': advance_paid_drivers,
         'company_breakdown': company_breakdown,
         'total_charging_cost': total_charging_cost,
+        'charging_details': charge_list,
     })
 
 
@@ -633,7 +645,7 @@ def export_excel(request):
         title_cell.alignment = center_align
 
         # Headers
-        headers = ['Date', 'No', 'Client', 'P/D', 'Time', 'Route', 'Total km', 'Status']
+        headers = ['Date', 'No', 'Client', 'P/D', 'Time', 'Route', 'Notes', 'Total km', 'Status']
         for col, header in enumerate(headers, 1):
             cell = ws.cell(row=2, column=col, value=header)
             cell.fill = header_fill
@@ -670,16 +682,17 @@ def export_excel(request):
                             ride.trip_type,
                             ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else '',
                             route,
+                            ride.notes or '',
                             float(ride.total_km) if ride.total_km is not None else '',
                             day_status if ride_number == 1 else '',
                         ]
                     else:
-                        data = [d.strftime('%d-%m-%Y'), '', '', '', '', '', '', day_status]
+                        data = [d.strftime('%d-%m-%Y'), '', '', '', '', '', '', '', day_status]
 
                     row_fill = full_fill if day_status == 'Full' else half_fill
                     for col, val in enumerate(data, 1):
                         cell = ws.cell(row=row_idx, column=col, value=val)
-                        cell.alignment = center_align if col != 6 else Alignment(horizontal='left')
+                        cell.alignment = center_align if col not in (6, 7) else Alignment(horizontal='left')
                         cell.border = border
                         cell.fill = row_fill
                     row_idx += 1
@@ -693,7 +706,7 @@ def export_excel(request):
                     day_label = 'Leave'
                     row_fill = leave_fill
 
-                data = [d.strftime('%d-%m-%Y'), '', '', '', '', '', '', day_label]
+                data = [d.strftime('%d-%m-%Y'), '', '', '', '', '', '', '', day_label]
                 for col, val in enumerate(data, 1):
                     cell = ws.cell(row=row_idx, column=col, value=val)
                     cell.alignment = center_align
@@ -705,8 +718,8 @@ def export_excel(request):
         total_row = row_idx + 1
         ws.cell(row=total_row, column=1, value='TOTAL RIDES').font = Font(bold=True)
         ws.cell(row=total_row, column=2, value=total_rides_count).font = Font(bold=True)
-        ws.cell(row=total_row, column=6, value='TOTAL SALARY').font = Font(bold=True)
-        ws.cell(row=total_row, column=8, value=total_salary).font = Font(bold=True)
+        ws.cell(row=total_row, column=7, value='TOTAL SALARY').font = Font(bold=True)
+        ws.cell(row=total_row, column=9, value=total_salary).font = Font(bold=True)
 
         # 2. Charges Sheet
         charge_sheet_name = f"{drv.name[:20]} - Charges"
@@ -764,7 +777,7 @@ def export_excel(request):
         
         # 4. Final Summary on Rides Sheet
         summary_row = total_row + 2
-        ws.merge_cells(f'A{summary_row}:H{summary_row}')
+        ws.merge_cells(f'A{summary_row}:I{summary_row}')
         summary_header = ws.cell(row=summary_row, column=1, value="PAYMENT SUMMARY")
         summary_header.font = Font(bold=True, size=11, color='FFFFFF')
         summary_header.fill = header_fill
@@ -772,21 +785,21 @@ def export_excel(request):
         
         row_idx = summary_row + 1
         ws.cell(row=row_idx, column=1, value='Total Salary (A)').font = Font(bold=True)
-        ws.cell(row=row_idx, column=8, value=total_salary)
+        ws.cell(row=row_idx, column=9, value=total_salary)
 
         row_idx += 1
         ws.cell(row=row_idx, column=1, value='Advance Salary Paid (B)').font = Font(bold=True)
-        adv_cell = ws.cell(row=row_idx, column=8, value=total_advance)
+        adv_cell = ws.cell(row=row_idx, column=9, value=total_advance)
         adv_cell.font = Font(bold=True, color='1565C0')
         
         row_idx += 1
         ws.cell(row=row_idx, column=1, value='SALARY TO BE PAID (A - B)').font = Font(bold=True)
-        net_cell = ws.cell(row=row_idx, column=8, value=total_salary - total_advance)
+        net_cell = ws.cell(row=row_idx, column=9, value=total_salary - total_advance)
         net_cell.font = Font(bold=True, size=12, color='2E7D32')
         net_cell.border = Border(bottom=Side(style='double'))
 
         # Column widths for both sheets
-        col_widths = [15, 15, 20, 8, 14, 34, 12, 14]
+        col_widths = [15, 15, 20, 8, 14, 34, 25, 12, 14]
         for i, width in enumerate(col_widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = width
             wsc.column_dimensions[get_column_letter(i)].width = width
@@ -864,7 +877,7 @@ def export_excel(request):
         wsr = wb.create_sheet(title="All Rides", index=0)
 
         # Title
-        wsr.merge_cells('A1:I1')
+        wsr.merge_cells('A1:J1')
         title_cell_r = wsr['A1']
         title_cell_r.value = "Consolidated Rides - All Drivers"
         title_cell_r.font = Font(bold=True, size=14, color='FFFFFF')
@@ -872,7 +885,7 @@ def export_excel(request):
         title_cell_r.alignment = center_align
 
         # Headers
-        rides_headers = ['Date', 'Driver Name', 'Client', 'P/D', 'Time', 'Route', 'Total km', 'Vehicle', 'Amount']
+        rides_headers = ['Date', 'Driver Name', 'Client', 'P/D', 'Time', 'Route', 'Notes', 'Total km', 'Vehicle', 'Amount']
         for col, header in enumerate(rides_headers, 1):
             cell = wsr.cell(row=2, column=col, value=header)
             cell.fill = header_fill
@@ -891,13 +904,14 @@ def export_excel(request):
                 ride.trip_type,
                 ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else '',
                 route,
+                ride.notes or '',
                 float(ride.total_km) if ride.total_km is not None else '',
                 ride.vehicle_number or '',
                 '',
             ]
             for col, val in enumerate(data, 1):
                 cell = wsr.cell(row=row_idx_r, column=col, value=val)
-                cell.alignment = center_align if col != 6 else Alignment(horizontal='left')
+                cell.alignment = center_align if col not in (6, 7) else Alignment(horizontal='left')
                 cell.border = border
             total_rides_all += 1
             row_idx_r += 1
@@ -908,7 +922,7 @@ def export_excel(request):
         wsr.cell(row=row_idx_r, column=3, value=total_rides_all).font = Font(bold=True)
 
         # Column widths
-        col_widths_r = [15, 22, 20, 8, 14, 34, 12, 14, 14]
+        col_widths_r = [15, 22, 20, 8, 14, 34, 25, 12, 14, 14]
         for i, width in enumerate(col_widths_r, 1):
             wsr.column_dimensions[get_column_letter(i)].width = width
 
@@ -923,6 +937,192 @@ def export_excel(request):
     if end_date_str:
         filename += f"_to_{end_date_str}"
     filename += ".xlsx"
+
+    response = HttpResponse(
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    wb.save(response)
+    return response
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def export_monthly_report(request):
+    if not (request.user.is_staff or request.user.is_superuser):
+        return Response({'error': 'Admin access required'}, status=403)
+
+    month_str = request.query_params.get('month')
+    year_str = request.query_params.get('year')
+
+    try:
+        month = int(month_str)
+        year = int(year_str)
+        if not (1 <= month <= 12):
+            raise ValueError()
+    except (TypeError, ValueError):
+        return Response({'error': 'Invalid month or year'}, status=400)
+
+    import calendar
+    import re
+
+    _, last_day = calendar.monthrange(year, month)
+    start_date = date(year, month, 1)
+    end_date = date(year, month, last_day)
+
+    # Find companies that have rides in this period, and all active companies
+    company_ids = Ride.objects.filter(
+        date__gte=start_date, date__lte=end_date
+    ).values_list('company_id', flat=True).distinct()
+    
+    companies_with_rides = Company.objects.filter(id__in=company_ids)
+    active_companies = Company.objects.filter(is_active=True)
+    companies = (companies_with_rides | active_companies).distinct().order_by('name')
+
+    # Also check if there are any rides with no company (company=None)
+    has_unassigned = Ride.objects.filter(
+        date__gte=start_date, date__lte=end_date, company__isnull=True
+    ).exists()
+
+    wb = openpyxl.Workbook()
+    # Remove default sheet to start clean
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    # Styles
+    rides_fill = PatternFill(start_color='1B5E20', end_color='1B5E20', fill_type='solid')
+    header_fill = PatternFill(start_color='1F3A5F', end_color='1F3A5F', fill_type='solid')
+    header_font = Font(bold=True, color='FFFFFF', size=11)
+    center_align = Alignment(horizontal='center')
+    left_align = Alignment(horizontal='left')
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin'),
+    )
+
+    headers = ['Date', 'Driver Name', 'Client', 'P/D', 'Time', 'Route', 'Total km', 'Vehicle']
+    col_widths = [15, 22, 18, 8, 12, 35, 12, 14]
+
+    def populate_sheet(ws, title, rides_list):
+        # Merge A1:H1 for title banner
+        ws.merge_cells('A1:H1')
+        title_cell = ws['A1']
+        title_cell.value = "Consolidated Rides - All Drivers"
+        title_cell.font = Font(bold=True, size=14, color='FFFFFF')
+        title_cell.fill = rides_fill
+        title_cell.alignment = center_align
+        ws.row_dimensions[1].height = 30
+
+        # Headers
+        ws.row_dimensions[2].height = 24
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=2, column=col, value=header)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = center_align
+            cell.border = border
+
+        # Data Rows
+        row_idx = 3
+        for ride in rides_list:
+            ws.row_dimensions[row_idx].height = 20
+            route = ride.route or f"{ride.pickup} to {ride.drop}"
+            ride_time_str = ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else ''
+            
+            data = [
+                ride.date.strftime('%d-%m-%Y'),
+                ride.driver.name,
+                ride.company.name if ride.company else '',
+                ride.trip_type,
+                ride_time_str,
+                route,
+                float(ride.total_km) if ride.total_km is not None else '',
+                ride.vehicle_number or '',
+            ]
+
+            for col, val in enumerate(data, 1):
+                cell = ws.cell(row=row_idx, column=col, value=val)
+                cell.alignment = left_align if col == 6 else center_align
+                cell.border = border
+            row_idx += 1
+
+        # Column widths
+        for i, width in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+
+    used_titles = set()
+    def get_unique_title(name):
+        cleaned = re.sub(r'[\\/*?:\[\]]', '', name)[:31]
+        if not cleaned:
+            cleaned = "Company"
+        temp = cleaned
+        counter = 1
+        while temp.lower() in used_titles:
+            suffix = f"_{counter}"
+            temp = cleaned[:31 - len(suffix)] + suffix
+            counter += 1
+        used_titles.add(temp.lower())
+        return temp
+
+    # Create sheets for each company
+    for comp in companies:
+        rides_qs = Ride.objects.select_related('company', 'driver').filter(
+            company=comp,
+            date__gte=start_date,
+            date__lte=end_date
+        )
+        rides_list = list(rides_qs.annotate(
+            trip_type_order=Case(
+                When(trip_type='P', then=Value(0)),
+                When(trip_type='D', then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
+
+        # Only create sheet if there are rides
+        if not rides_list:
+            continue
+
+        sheet_title = get_unique_title(comp.name)
+        ws = wb.create_sheet(title=sheet_title)
+        populate_sheet(ws, comp.name, rides_list)
+
+    # Handle unassigned company rides if any
+    if has_unassigned:
+        rides_qs = Ride.objects.select_related('company', 'driver').filter(
+            company__isnull=True,
+            date__gte=start_date,
+            date__lte=end_date
+        )
+        rides_list = list(rides_qs.annotate(
+            trip_type_order=Case(
+                When(trip_type='P', then=Value(0)),
+                When(trip_type='D', then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
+
+        if rides_list:
+            sheet_title = get_unique_title("Other")
+            ws = wb.create_sheet(title=sheet_title)
+            populate_sheet(ws, "Other", rides_list)
+
+    # Fallback if no sheets were created
+    if len(wb.sheetnames) == 0:
+        ws = wb.create_sheet(title="Report")
+        ws.merge_cells('A1:H1')
+        title_cell = ws['A1']
+        title_cell.value = "No rides recorded for this period."
+        title_cell.font = Font(bold=True, size=12)
+        title_cell.alignment = center_align
+
+    # Filename
+    month_name = calendar.month_name[month]
+    filename = f"monthly_report_{month_name}_{year}.xlsx"
 
     response = HttpResponse(
         content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -970,13 +1170,13 @@ def export_driver_excel(request):
         bottom=Side(style='thin'),
     )
 
-    ws.merge_cells('A1:H1')
+    ws.merge_cells('A1:I1')
     title_cell = ws['A1']
     title_cell.value = f"Ride Manifest - {driver.name} ({period_str.replace('_', ' ')})"
     title_cell.font = Font(bold=True, size=13)
     title_cell.alignment = center_align
 
-    headers = ['Date', 'No', 'Client', 'P/D', 'Time', 'Route', 'Total km', 'Vehicle']
+    headers = ['Date', 'No', 'Client', 'P/D', 'Time', 'Route', 'Notes', 'Total km', 'Vehicle']
     for col, header in enumerate(headers, 1):
         cell = ws.cell(row=2, column=col, value=header)
         cell.fill = header_fill
@@ -1001,15 +1201,16 @@ def export_driver_excel(request):
                     ride.trip_type,
                     ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else '',
                     route,
+                    ride.notes or '',
                     float(ride.total_km) if ride.total_km is not None else '',
                     ride.vehicle_number,
                 ]
             else:
-                data = [att.date.strftime('%d-%m-%Y'), '', '', '', '', '', '', '']
+                data = [att.date.strftime('%d-%m-%Y'), '', '', '', '', '', '', '', '']
 
             for col, val in enumerate(data, 1):
                 cell = ws.cell(row=row_idx, column=col, value=val)
-                cell.alignment = center_align if col != 6 else Alignment(horizontal='left')
+                cell.alignment = center_align if col not in (6, 7) else Alignment(horizontal='left')
                 cell.border = border
                 if att.status == 'Full':
                     cell.fill = PatternFill(start_color='E8F5E9', end_color='E8F5E9', fill_type='solid')
@@ -1024,7 +1225,7 @@ def export_driver_excel(request):
     salary_cell = ws.cell(row=total_row, column=6, value=f"Salary: {total_salary}")
     salary_cell.font = Font(bold=True)
 
-    col_widths = [15, 8, 20, 8, 14, 34, 12, 14]
+    col_widths = [15, 8, 20, 8, 14, 34, 25, 12, 14]
     for i, width in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = width
 
