@@ -181,6 +181,13 @@ class CarChargeSerializer(serializers.ModelSerializer):
         driver = self.context['request'].user.driver_profile
         validated_data['driver'] = driver
         return super().create(validated_data)
+
+
+class AdminCarChargeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CarCharge
+        fields = ['id', 'driver', 'date', 'app_used', 'time', 'place', 'vehicle_number', 'charge_amount', 'created_at']
+        read_only_fields = ['id', 'created_at']
 class VehicleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Vehicle

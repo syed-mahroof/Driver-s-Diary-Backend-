@@ -150,7 +150,7 @@ class PasswordResetOTP(models.Model):
 
 
 class CarCharge(models.Model):
-    driver = models.ForeignKey(Driver, on_delete=models.CASCADE, related_name='charges')
+    driver = models.ForeignKey(Driver, on_delete=models.CASCADE, related_name='charges', null=True, blank=True)
     date = models.DateField(db_index=True)
     app_used = models.CharField(max_length=100)
     time = models.TimeField()
@@ -160,7 +160,8 @@ class CarCharge(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
-        return f"{self.driver.name} - {self.date} - {self.charge_amount}"
+        driver_name = self.driver.name if self.driver else "No Driver"
+        return f"{driver_name} - {self.date} - {self.charge_amount}"
 
     class Meta:
         ordering = ['-date', '-time']

@@ -22,7 +22,8 @@ from .serializers import (
     SyncPayloadSerializer, AttendanceSerializer, DriverSerializer,
     RegisterSerializer, UserSerializer, CabTokenObtainPairSerializer,
     ForgotPasswordRequestSerializer, VerifyOTPSerializer, ResetPasswordSerializer,
-    CarChargeSerializer, VehicleSerializer, AdvanceSalaryRequestSerializer
+    CarChargeSerializer, VehicleSerializer, AdvanceSalaryRequestSerializer,
+    AdminCarChargeSerializer
 )
 
 
@@ -222,6 +223,12 @@ def driver_dashboard(request):
     full_rate = getattr(settings, 'FULL_DAY_RATE', 1000)
     half_rate = getattr(settings, 'HALF_DAY_RATE', 500)
 
+    # Q filter: rides linked to Zellis or Dodge are billed by distance @ Rs 3.5/km
+    special_company_q = (
+        Q(company__name__icontains='zellis') |
+        Q(company__name__icontains='dodge')
+    )
+
     today_rides_qs = Ride.objects.filter(driver=driver, date=today)
     today_count = today_rides_qs.count()
 
@@ -232,6 +239,29 @@ def driver_dashboard(request):
         today_rides_qs.select_related('company').order_by('-created_at')[:10],
         many=True
     ).data
+
+    # ── Daily earnings aggregates ────────────────────────────────────────────
+    today_standard_rides = today_rides_qs.exclude(special_company_q).count()
+    today_special_kms_agg = (
+        today_rides_qs
+        .filter(special_company_q)
+        .aggregate(total=Sum('total_km'))
+    )
+    today_special_kms = float(today_special_kms_agg['total'] or 0)
+
+    # ── Monthly earnings aggregates ──────────────────────────────────────────
+    month_rides_qs = Ride.objects.filter(
+        driver=driver,
+        date__year=today.year,
+        date__month=today.month,
+    )
+    monthly_standard_rides = month_rides_qs.exclude(special_company_q).count()
+    monthly_special_kms_agg = (
+        month_rides_qs
+        .filter(special_company_q)
+        .aggregate(total=Sum('total_km'))
+    )
+    monthly_special_kms = float(monthly_special_kms_agg['total'] or 0)
 
     return Response({
         'driver_id': driver.id,
@@ -244,6 +274,12 @@ def driver_dashboard(request):
         'recent_rides': recent_rides,
         'default_vehicle_number': driver.default_vehicle_number,
         'default_seater': driver.default_seater,
+        # ── NEW: earnings engine aggregates ──────────────────────────────────
+        'today_standard_rides': today_standard_rides,
+        'today_special_kms': today_special_kms,
+        'monthly_standard_rides': monthly_standard_rides,
+        'monthly_special_kms': monthly_special_kms,
+        'monthly_target': 120,
     })
 
 
@@ -395,6 +431,16 @@ def create_driver(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def admin_create_car_charge(request):
+    serializer = AdminCarChargeSerializer(data=request.data)
+    if serializer.is_valid():
+        charge = serializer.save()
+        return Response(AdminCarChargeSerializer(charge).data, status=status.HTTP_201_CREATED)
+    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def admin_dashboard(request):
@@ -469,7 +515,7 @@ def admin_dashboard(request):
 
     charge_list = [{
         'id': c.id,
-        'driver_name': c.driver.name,
+        'driver_name': c.driver.name if c.driver else 'No Driver',
         'date': c.date.strftime('%Y-%m-%d'),
         'app_used': c.app_used,
         'time': c.time.strftime('%I:%M %p').lstrip('0') if c.time else '',

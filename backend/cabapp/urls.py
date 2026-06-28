@@ -31,6 +31,7 @@ urlpatterns = [
     path('admin/dashboard/', views.admin_dashboard, name='admin_dashboard'),
     path('admin/drivers/', views.list_drivers, name='list_drivers'),
     path('admin/drivers/create/', views.create_driver, name='create_driver'),
+    path('admin/charge/create/', views.admin_create_car_charge, name='admin_create_car_charge'),
     path('companies/create/', views.create_company, name='create_company'),
     path('reports/', views.reports, name='reports'),
     path('export-excel/', views.export_excel, name='export_excel'),
