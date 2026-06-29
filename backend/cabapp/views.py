@@ -621,17 +621,7 @@ def reports(request):
             'rides': rides,
         })
 
-    
-    total_salary = sum(float(r['salary'] or 0) for r in results)
-    if is_monthly:
-        salary_start, salary_end = get_trailing_month_range(today.year, today.month)
-        sal_qs = Attendance.objects.filter(driver=driver, date__gte=salary_start, date__lte=salary_end)
-        total_salary = float(sal_qs.aggregate(t=Sum('salary'))['t'] or 0)
-
-    return Response({
-        'results': results,
-        'total_salary_override': total_salary
-    })
+    return Response(results)
 
 
 @api_view(['GET'])
