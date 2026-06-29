@@ -5,6 +5,27 @@ from django.db.models import Count, Sum, Q, Case, When, Value, IntegerField
 from django.http import HttpResponse
 from django.conf import settings
 from rest_framework import status, generics
+
+import calendar
+from datetime import date, timedelta
+
+def get_trailing_month_range(year, month):
+    if month == 1:
+        start_date = date(year - 1, 12, 15)
+    else:
+        start_date = date(year, month - 1, 15)
+    end_date = date(year, month, 15)
+    return start_date, end_date
+
+def is_full_month(d_start, d_end):
+    if not d_start or not d_end:
+        return False
+    if d_start.day != 1:
+        return False
+    _, last_day = calendar.monthrange(d_end.year, d_end.month)
+    return d_end.day == last_day and d_start.month == d_end.month and d_start.year == d_end.year
+
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
@@ -250,10 +271,11 @@ def driver_dashboard(request):
     today_special_kms = float(today_special_kms_agg['total'] or 0)
 
     # ── Monthly earnings aggregates ──────────────────────────────────────────
+    salary_start, salary_end = get_trailing_month_range(today.year, today.month)
     month_rides_qs = Ride.objects.filter(
         driver=driver,
-        date__year=today.year,
-        date__month=today.month,
+        date__gte=salary_start,
+        date__lte=salary_end,
     )
     monthly_standard_rides = month_rides_qs.exclude(special_company_q).count()
     monthly_special_kms_agg = (
@@ -471,8 +493,19 @@ def admin_dashboard(request):
     stats_agg = attendance_qs.aggregate(
         total_half_days=Count('id', filter=Q(status='Half')),
         total_full_days=Count('id', filter=Q(status='Full')),
-        total_salary=Sum('salary'),
     )
+
+    d_start_parsed = date.fromisoformat(start_date) if start_date else None
+    d_end_parsed = date.fromisoformat(end_date) if end_date else None
+    if is_full_month(d_start_parsed, d_end_parsed):
+        salary_start, salary_end = get_trailing_month_range(d_end_parsed.year, d_end_parsed.month)
+        sal_qs = Attendance.objects.filter(date__gte=salary_start, date__lte=salary_end)
+        if driver_id:
+            sal_qs = sal_qs.filter(driver_id=driver_id)
+        stats_agg['total_salary'] = sal_qs.aggregate(total_salary=Sum('salary'))['total_salary']
+    else:
+        stats_agg['total_salary'] = attendance_qs.aggregate(total_salary=Sum('salary'))['total_salary']
+
 
     # Advance salary stats
     advance_qs = AdvanceSalaryRequest.objects.select_related('driver').all()
@@ -588,7 +621,17 @@ def reports(request):
             'rides': rides,
         })
 
-    return Response(results)
+    
+    total_salary = sum(float(r['salary'] or 0) for r in results)
+    if is_monthly:
+        salary_start, salary_end = get_trailing_month_range(today.year, today.month)
+        sal_qs = Attendance.objects.filter(driver=driver, date__gte=salary_start, date__lte=salary_end)
+        total_salary = float(sal_qs.aggregate(t=Sum('salary'))['t'] or 0)
+
+    return Response({
+        'results': results,
+        'total_salary_override': total_salary
+    })
 
 
 @api_view(['GET'])
@@ -764,6 +807,11 @@ def export_excel(request):
         total_row = row_idx + 1
         ws.cell(row=total_row, column=1, value='TOTAL RIDES').font = Font(bold=True)
         ws.cell(row=total_row, column=2, value=total_rides_count).font = Font(bold=True)
+        if is_full_month(d_start, d_end):
+            salary_start, salary_end = get_trailing_month_range(d_end.year, d_end.month)
+            sal_qs = Attendance.objects.filter(driver_id=drv.id, date__gte=salary_start, date__lte=salary_end)
+            total_salary = sal_qs.aggregate(t=Sum('salary'))['t'] or 0
+
         ws.cell(row=total_row, column=7, value='TOTAL SALARY').font = Font(bold=True)
         ws.cell(row=total_row, column=9, value=total_salary).font = Font(bold=True)
 
@@ -1191,7 +1239,9 @@ def export_driver_excel(request):
     
     qs = Attendance.objects.filter(driver=driver)
     
+    is_monthly = False
     if period == 'month':
+        is_monthly = True
         qs = qs.filter(date__year=today.year, date__month=today.month)
         period_str = today.strftime('%b_%Y')
     elif period == 'year':
@@ -1265,6 +1315,11 @@ def export_driver_excel(request):
             row_idx += 1
         total_salary += float(att.salary)
 
+    if is_monthly:
+        salary_start, salary_end = get_trailing_month_range(today.year, today.month)
+        sal_qs = Attendance.objects.filter(driver=driver, date__gte=salary_start, date__lte=salary_end)
+        total_salary = sal_qs.aggregate(t=Sum('salary'))['t'] or 0
+
     total_row = row_idx + 1
     ws.cell(row=total_row, column=1, value='TOTAL RIDES').font = Font(bold=True)
     ws.cell(row=total_row, column=2, value=sum(a.total_rides for a in attendances)).font = Font(bold=True)
@@ -1310,7 +1365,9 @@ def driver_report_data(request):
     today = date.today()
     
     qs = Attendance.objects.filter(driver=driver)
+    is_monthly = False
     if period == 'month':
+        is_monthly = True
         qs = qs.filter(date__year=today.year, date__month=today.month)
     elif period == 'year':
         qs = qs.filter(date__year=today.year)
