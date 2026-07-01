@@ -285,6 +285,15 @@ def driver_dashboard(request):
     )
     monthly_special_kms = float(monthly_special_kms_agg['total'] or 0)
 
+    if today.day < 15:
+        if today.month == 1:
+            cycle_start = date(today.year - 1, 12, 15)
+        else:
+            cycle_start = date(today.year, today.month - 1, 15)
+    else:
+        cycle_start = date(today.year, today.month, 15)
+    cycle_days_elapsed = (today - cycle_start).days + 1
+
     return Response({
         'driver_id': driver.id,
         'driver_name': driver.name,
@@ -302,6 +311,7 @@ def driver_dashboard(request):
         'monthly_standard_rides': monthly_standard_rides,
         'monthly_special_kms': monthly_special_kms,
         'monthly_target': 120,
+        'cycle_days_elapsed': cycle_days_elapsed,
     })
 
 
