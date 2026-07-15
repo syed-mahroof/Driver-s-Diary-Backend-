@@ -285,6 +285,14 @@ def driver_dashboard(request):
     )
     monthly_special_kms = float(monthly_special_kms_agg['total'] or 0)
 
+    attendance_qs = Attendance.objects.filter(
+        driver=driver,
+        date__gte=salary_start,
+        date__lte=salary_end,
+    )
+    monthly_attendance_stats = attendance_qs.values('status').annotate(count=Count('id'))
+    attendance_dict = {item['status']: item['count'] for item in monthly_attendance_stats}
+
     if today.day < 15:
         if today.month == 1:
             cycle_start = date(today.year - 1, 12, 15)
@@ -312,6 +320,10 @@ def driver_dashboard(request):
         'monthly_special_kms': monthly_special_kms,
         'monthly_target': 120,
         'cycle_days_elapsed': cycle_days_elapsed,
+        'monthly_full_days': attendance_dict.get('Full', 0),
+        'monthly_half_days': attendance_dict.get('Half', 0),
+        'monthly_leaves': attendance_dict.get('Leave', 0),
+        'monthly_holidays': attendance_dict.get('Holiday', 0),
     })
 
 
