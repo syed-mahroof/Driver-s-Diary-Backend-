@@ -10,12 +10,24 @@ import calendar
 from datetime import date, timedelta
 
 def get_trailing_month_range(year, month):
+    """Salary cycle ending on the 15th of (year, month): runs 16th of the
+    previous month through the 15th of this one."""
     if month == 1:
-        start_date = date(year - 1, 12, 15)
+        start_date = date(year - 1, 12, 16)
     else:
-        start_date = date(year, month - 1, 15)
+        start_date = date(year, month - 1, 16)
     end_date = date(year, month, 15)
     return start_date, end_date
+
+
+def get_cycle_end_year_month(ref_date):
+    """Which (year, month) cycle — per get_trailing_month_range — contains ref_date.
+    From the 16th onward, ref_date belongs to the cycle ending next month."""
+    if ref_date.day >= 16:
+        if ref_date.month == 12:
+            return ref_date.year + 1, 1
+        return ref_date.year, ref_date.month + 1
+    return ref_date.year, ref_date.month
 
 def is_full_month(d_start, d_end):
     if not d_start or not d_end:
@@ -271,7 +283,8 @@ def driver_dashboard(request):
     today_special_kms = float(today_special_kms_agg['total'] or 0)
 
     # ── Monthly earnings aggregates ──────────────────────────────────────────
-    salary_start, salary_end = get_trailing_month_range(today.year, today.month)
+    cycle_end_year, cycle_end_month = get_cycle_end_year_month(today)
+    salary_start, salary_end = get_trailing_month_range(cycle_end_year, cycle_end_month)
     month_rides_qs = Ride.objects.filter(
         driver=driver,
         date__gte=salary_start,
@@ -293,14 +306,7 @@ def driver_dashboard(request):
     monthly_attendance_stats = attendance_qs.values('status').annotate(count=Count('id'))
     attendance_dict = {item['status']: item['count'] for item in monthly_attendance_stats}
 
-    if today.day < 15:
-        if today.month == 1:
-            cycle_start = date(today.year - 1, 12, 15)
-        else:
-            cycle_start = date(today.year, today.month - 1, 15)
-    else:
-        cycle_start = date(today.year, today.month, 15)
-    cycle_days_elapsed = (today - cycle_start).days + 1
+    cycle_days_elapsed = (today - salary_start).days + 1
 
     return Response({
         'driver_id': driver.id,
@@ -320,6 +326,8 @@ def driver_dashboard(request):
         'monthly_special_kms': monthly_special_kms,
         'monthly_target': 120,
         'cycle_days_elapsed': cycle_days_elapsed,
+        'cycle_start': salary_start.isoformat(),
+        'cycle_end': salary_end.isoformat(),
         'monthly_full_days': attendance_dict.get('Full', 0),
         'monthly_half_days': attendance_dict.get('Half', 0),
         'monthly_leaves': attendance_dict.get('Leave', 0),
@@ -1328,7 +1336,8 @@ def export_driver_excel(request):
         total_salary += float(att.salary)
 
     if is_monthly:
-        salary_start, salary_end = get_trailing_month_range(today.year, today.month)
+        cycle_end_year, cycle_end_month = get_cycle_end_year_month(today)
+        salary_start, salary_end = get_trailing_month_range(cycle_end_year, cycle_end_month)
         sal_qs = Attendance.objects.filter(driver=driver, date__gte=salary_start, date__lte=salary_end)
         total_salary = sal_qs.aggregate(t=Sum('salary'))['t'] or 0
 
