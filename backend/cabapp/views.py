@@ -308,6 +308,13 @@ def driver_dashboard(request):
 
     cycle_days_elapsed = (today - salary_start).days + 1
 
+    cycle_advance_paid = AdvanceSalaryRequest.objects.filter(
+        driver=driver,
+        status='Paid',
+        resolved_date__date__gte=salary_start,
+        resolved_date__date__lte=salary_end,
+    ).aggregate(total=Sum('amount'))['total'] or 0
+
     return Response({
         'driver_id': driver.id,
         'driver_name': driver.name,
@@ -332,6 +339,7 @@ def driver_dashboard(request):
         'monthly_half_days': attendance_dict.get('Half', 0),
         'monthly_leaves': attendance_dict.get('Leave', 0),
         'monthly_holidays': attendance_dict.get('Holiday', 0),
+        'cycle_advance_paid': float(cycle_advance_paid),
     })
 
 
@@ -554,6 +562,13 @@ def admin_dashboard(request):
     
     total_advance_paid = sum(float(a.amount) for a in paid_advances)
     advance_paid_drivers = list(set(a.driver.name for a in paid_advances))
+    advance_details = [{
+        'id': a.id,
+        'driver_name': a.driver.name,
+        'date': a.resolved_date.strftime('%Y-%m-%d') if a.resolved_date else '',
+        'amount': float(a.amount),
+        'reason': a.reason,
+    } for a in paid_advances.order_by('-resolved_date')]
 
     # Company breakdown
     company_stats = ride_qs.values('company__name').annotate(
@@ -601,6 +616,7 @@ def admin_dashboard(request):
         'pending_advance_count': pending_advance_count,
         'total_advance_paid': total_advance_paid,
         'advance_paid_drivers': advance_paid_drivers,
+        'advance_details': advance_details,
         'company_breakdown': company_breakdown,
         'total_charging_cost': total_charging_cost,
         'charging_details': charge_list,
