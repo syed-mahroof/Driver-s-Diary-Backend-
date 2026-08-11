@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 import random
+import re
 from django.db import transaction
 from django.db.models import Count, Sum, Q, Case, When, Value, IntegerField
 from django.http import HttpResponse
@@ -36,6 +37,21 @@ def is_full_month(d_start, d_end):
         return False
     _, last_day = calendar.monthrange(d_end.year, d_end.month)
     return d_end.day == last_day and d_start.month == d_end.month and d_start.year == d_end.year
+
+
+def make_unique_sheet_title(name, used_titles, fallback='Sheet'):
+    """Sanitize and deduplicate Excel worksheet titles (max 31 chars)."""
+    cleaned = re.sub(r'[\\/*?:\[\]]', '', str(name)).strip()[:31]
+    if not cleaned:
+        cleaned = fallback
+    temp = cleaned
+    counter = 1
+    while temp.lower() in used_titles:
+        suffix = f"_{counter}"
+        temp = cleaned[:31 - len(suffix)] + suffix
+        counter += 1
+    used_titles.add(temp.lower())
+    return temp
 
 
 from rest_framework.decorators import api_view, permission_classes
@@ -699,6 +715,13 @@ def export_excel(request):
     # Get drivers to include
     if driver_id:
         target_drivers = list(Driver.objects.filter(id=driver_id, is_active=True))
+    elif company_id:
+        driver_ids = Ride.objects.filter(
+            date__gte=d_start,
+            date__lte=d_end,
+            company_id=company_id,
+        ).values_list('driver_id', flat=True).distinct()
+        target_drivers = list(Driver.objects.filter(id__in=driver_ids, is_active=True).order_by('name'))
     else:
         target_drivers = list(Driver.objects.filter(is_active=True).order_by('name'))
 
@@ -751,10 +774,11 @@ def export_excel(request):
     leave_fill = PatternFill(start_color='FFCDD2', end_color='FFCDD2', fill_type='solid')
     holiday_fill = PatternFill(start_color='E0E0E0', end_color='E0E0E0', fill_type='solid')
 
+    used_sheet_titles = set()
     first = True
     for drv in target_drivers:
         # 1. Rides Sheet
-        sheet_name = drv.name[:31]
+        sheet_name = make_unique_sheet_title(drv.name, used_sheet_titles, fallback=f'Driver {drv.id}')
         if first:
             ws = wb.active
             ws.title = sheet_name
@@ -852,7 +876,9 @@ def export_excel(request):
         ws.cell(row=total_row, column=9, value=total_salary).font = Font(bold=True)
 
         # 2. Charges Sheet
-        charge_sheet_name = f"{drv.name[:20]} - Charges"
+        charge_sheet_name = make_unique_sheet_title(
+            f"{drv.name} - Charges", used_sheet_titles, fallback=f'Charges {drv.id}'
+        )
         wsc = wb.create_sheet(title=charge_sheet_name)
         
         # Title
@@ -960,7 +986,7 @@ def export_excel(request):
         for charge in charge_qs_all.select_related('driver').order_by('date', 'time'):
             data = [
                 charge.date.strftime('%d-%m-%Y'),
-                charge.driver.name,
+                charge.driver.name if charge.driver else 'No Driver',
                 charge.app_used,
                 charge.time.strftime('%I:%M %p').lstrip('0'),
                 charge.place,
@@ -1094,7 +1120,6 @@ def export_monthly_report(request):
         return Response({'error': 'Invalid month or year'}, status=400)
 
     import calendar
-    import re
 
     _, last_day = calendar.monthrange(year, month)
     start_date = date(year, month, 1)
@@ -1183,18 +1208,6 @@ def export_monthly_report(request):
             ws.column_dimensions[get_column_letter(i)].width = width
 
     used_titles = set()
-    def get_unique_title(name):
-        cleaned = re.sub(r'[\\/*?:\[\]]', '', name)[:31]
-        if not cleaned:
-            cleaned = "Company"
-        temp = cleaned
-        counter = 1
-        while temp.lower() in used_titles:
-            suffix = f"_{counter}"
-            temp = cleaned[:31 - len(suffix)] + suffix
-            counter += 1
-        used_titles.add(temp.lower())
-        return temp
 
     # Create sheets for each company
     for comp in companies:
@@ -1216,7 +1229,7 @@ def export_monthly_report(request):
         if not rides_list:
             continue
 
-        sheet_title = get_unique_title(comp.name)
+        sheet_title = make_unique_sheet_title(comp.name, used_titles, fallback='Company')
         ws = wb.create_sheet(title=sheet_title)
         populate_sheet(ws, comp.name, rides_list)
 
@@ -1237,7 +1250,7 @@ def export_monthly_report(request):
         ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
 
         if rides_list:
-            sheet_title = get_unique_title("Other")
+            sheet_title = make_unique_sheet_title("Other", used_titles, fallback='Other')
             ws = wb.create_sheet(title=sheet_title)
             populate_sheet(ws, "Other", rides_list)
 
