@@ -528,6 +528,7 @@ def admin_dashboard(request):
     end_date = request.query_params.get('end_date')
     driver_id = request.query_params.get('driver_id')
     company_id = request.query_params.get('company_id')
+    vehicle_number = request.query_params.get('vehicle_number')
 
     attendance_qs = Attendance.objects.all()
     ride_qs = Ride.objects.all()
@@ -543,6 +544,14 @@ def admin_dashboard(request):
         ride_qs = ride_qs.filter(driver_id=driver_id)
     if company_id:
         ride_qs = ride_qs.filter(company_id=company_id)
+    if vehicle_number:
+        ride_qs = ride_qs.filter(vehicle_number=vehicle_number)
+        # Align attendance to drivers who actually drove this vehicle in range
+        vehicle_driver_ids = ride_qs.values_list('driver_id', flat=True).distinct()
+        attendance_qs = attendance_qs.filter(driver_id__in=vehicle_driver_ids)
+    elif company_id:
+        company_driver_ids = ride_qs.values_list('driver_id', flat=True).distinct()
+        attendance_qs = attendance_qs.filter(driver_id__in=company_driver_ids)
 
     stats_agg = attendance_qs.aggregate(
         total_half_days=Count('id', filter=Q(status='Half')),
@@ -605,6 +614,7 @@ def admin_dashboard(request):
     if start_date: charge_qs = charge_qs.filter(date__gte=start_date)
     if end_date: charge_qs = charge_qs.filter(date__lte=end_date)
     if driver_id: charge_qs = charge_qs.filter(driver_id=driver_id)
+    if vehicle_number: charge_qs = charge_qs.filter(vehicle_number=vehicle_number)
     total_charging_cost = float(charge_qs.aggregate(total=Sum('charge_amount'))['total'] or 0)
 
     charge_list = [{
@@ -620,7 +630,11 @@ def admin_dashboard(request):
 
     # Drivers target achieved (count drivers who have at least one 'Full' day in the period)
     drivers_target_achieved = attendance_qs.filter(status='Full').values('driver').distinct().count()
-    total_active_drivers = Driver.objects.filter(is_active=True).count()
+    # When filters are applied, show drivers present in the filtered ride set
+    if company_id or vehicle_number or driver_id:
+        total_active_drivers = ride_qs.values('driver_id').distinct().count()
+    else:
+        total_active_drivers = Driver.objects.filter(is_active=True).count()
 
     return Response({
         'total_rides': ride_qs.count(),
@@ -649,29 +663,62 @@ def reports(request):
     end_date = request.query_params.get('end_date')
     driver_id = request.query_params.get('driver_id')
     company_id = request.query_params.get('company_id')
+    vehicle_number = request.query_params.get('vehicle_number')
+
+    # Prefer ride-centric filtering so company/vehicle filters only return matching rides
+    rides_base = Ride.objects.select_related('company', 'driver')
+    if start_date:
+        rides_base = rides_base.filter(date__gte=start_date)
+    if end_date:
+        rides_base = rides_base.filter(date__lte=end_date)
+    if driver_id:
+        rides_base = rides_base.filter(driver_id=driver_id)
+    if company_id:
+        rides_base = rides_base.filter(company_id=company_id)
+    if vehicle_number:
+        rides_base = rides_base.filter(vehicle_number=vehicle_number)
+
+    # Company / vehicle filters: only days that actually have matching rides
+    if company_id or vehicle_number:
+        # Only days that actually have matching rides
+        pairs = list(rides_base.values_list('driver_id', 'date').distinct())
+        pairs.sort(key=lambda item: (item[1], item[0]), reverse=True)
+        results = []
+        for driver_id_val, ride_date in pairs:
+            att = Attendance.objects.select_related('driver').filter(
+                driver_id=driver_id_val, date=ride_date
+            ).first()
+            day_rides = rides_base.filter(driver_id=driver_id_val, date=ride_date).order_by(
+                'ride_time', 'created_at'
+            )
+            rides = RideSerializer(day_rides, many=True).data
+            if not rides:
+                continue
+            driver = att.driver if att else day_rides.first().driver
+            results.append({
+                'driver_name': driver.name,
+                'driver_id': driver_id_val,
+                'date': ride_date,
+                'total_rides': len(rides),
+                'status': att.status if att else '',
+                'salary': att.salary if att else 0,
+                'rides': rides,
+            })
+        return Response(results)
 
     qs = Attendance.objects.select_related('driver').all()
-
     if start_date:
         qs = qs.filter(date__gte=start_date)
     if end_date:
         qs = qs.filter(date__lte=end_date)
     if driver_id:
         qs = qs.filter(driver_id=driver_id)
-    if company_id:
-        driver_ids_with_company = Ride.objects.filter(company_id=company_id)
-        if start_date:
-            driver_ids_with_company = driver_ids_with_company.filter(date__gte=start_date)
-        if end_date:
-            driver_ids_with_company = driver_ids_with_company.filter(date__lte=end_date)
-        driver_ids = driver_ids_with_company.values_list('driver_id', flat=True).distinct()
-        qs = qs.filter(driver_id__in=driver_ids)
 
     results = []
     for att in qs.order_by('-date', 'driver__name'):
         rides_qs = Ride.objects.select_related('company').filter(driver=att.driver, date=att.date)
-        if company_id:
-            rides_qs = rides_qs.filter(company_id=company_id)
+        if vehicle_number:
+            rides_qs = rides_qs.filter(vehicle_number=vehicle_number)
         rides = RideSerializer(rides_qs.order_by('ride_time', 'created_at'), many=True).data
         results.append({
             'driver_name': att.driver.name,
@@ -696,6 +743,7 @@ def export_excel(request):
     end_date_str = request.query_params.get('end_date')
     driver_id = request.query_params.get('driver_id')
     company_id = request.query_params.get('company_id')
+    vehicle_number = request.query_params.get('vehicle_number')
 
     # Parse date range
     try:
@@ -712,15 +760,21 @@ def export_excel(request):
         all_dates.append(current)
         current += timedelta(days=1)
 
+    scoped_filters = bool(company_id or vehicle_number)
+
     # Get drivers to include
+    rides_scope = Ride.objects.filter(date__gte=d_start, date__lte=d_end)
+    if driver_id:
+        rides_scope = rides_scope.filter(driver_id=driver_id)
+    if company_id:
+        rides_scope = rides_scope.filter(company_id=company_id)
+    if vehicle_number:
+        rides_scope = rides_scope.filter(vehicle_number=vehicle_number)
+
     if driver_id:
         target_drivers = list(Driver.objects.filter(id=driver_id, is_active=True))
-    elif company_id:
-        driver_ids = Ride.objects.filter(
-            date__gte=d_start,
-            date__lte=d_end,
-            company_id=company_id,
-        ).values_list('driver_id', flat=True).distinct()
+    elif scoped_filters:
+        driver_ids = rides_scope.values_list('driver_id', flat=True).distinct()
         target_drivers = list(Driver.objects.filter(id__in=driver_ids, is_active=True).order_by('name'))
     else:
         target_drivers = list(Driver.objects.filter(is_active=True).order_by('name'))
@@ -731,6 +785,8 @@ def export_excel(request):
     )
     if driver_id:
         att_qs = att_qs.filter(driver_id=driver_id)
+    elif scoped_filters:
+        att_qs = att_qs.filter(driver_id__in=[d.id for d in target_drivers])
 
     # Build attendance lookup: {(driver_id, date): attendance}
     att_lookup = {}
@@ -741,6 +797,8 @@ def export_excel(request):
     charge_qs_all = CarCharge.objects.filter(date__gte=d_start, date__lte=d_end)
     if driver_id:
         charge_qs_all = charge_qs_all.filter(driver_id=driver_id)
+    if vehicle_number:
+        charge_qs_all = charge_qs_all.filter(vehicle_number=vehicle_number)
 
     # Fetch advance salary requests (Paid) for the period
     advance_qs_all = AdvanceSalaryRequest.objects.filter(
@@ -810,33 +868,31 @@ def export_excel(request):
             att = att_lookup.get((drv.id, d))
             is_weekend = d.weekday() in (5, 6)
 
-            if att and att.total_rides > 0:
-                # Has rides - show ride details
-                rides_qs = Ride.objects.select_related('company').filter(driver=drv, date=d)
-                if company_id:
-                    rides_qs = rides_qs.filter(company_id=company_id)
-                rides = list(rides_qs.order_by('ride_time', 'created_at')) or [None]
+            rides_qs = Ride.objects.select_related('company').filter(driver=drv, date=d)
+            if company_id:
+                rides_qs = rides_qs.filter(company_id=company_id)
+            if vehicle_number:
+                rides_qs = rides_qs.filter(vehicle_number=vehicle_number)
+            rides = list(rides_qs.order_by('ride_time', 'created_at'))
 
-                day_status = att.status
-                day_salary = float(att.salary)
-                total_rides_count += att.total_rides
+            if rides:
+                day_status = att.status if att else ''
+                day_salary = float(att.salary) if att and not scoped_filters else 0
+                total_rides_count += len(rides)
 
                 for ride_number, ride in enumerate(rides, 1):
-                    if ride:
-                        route = ride.route or f"{ride.pickup} to {ride.drop}"
-                        data = [
-                            d.strftime('%d-%m-%Y'),
-                            ride_number,
-                            ride.company.name if ride.company else '',
-                            ride.trip_type,
-                            ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else '',
-                            route,
-                            ride.notes or '',
-                            float(ride.total_km) if ride.total_km is not None else '',
-                            day_status if ride_number == 1 else '',
-                        ]
-                    else:
-                        data = [d.strftime('%d-%m-%Y'), '', '', '', '', '', '', '', day_status]
+                    route = ride.route or f"{ride.pickup} to {ride.drop}"
+                    data = [
+                        d.strftime('%d-%m-%Y'),
+                        ride_number,
+                        ride.company.name if ride.company else '',
+                        ride.trip_type,
+                        ride.ride_time.strftime('%I:%M %p').lstrip('0') if ride.ride_time else '',
+                        route,
+                        ride.notes or '',
+                        float(ride.total_km) if ride.total_km is not None else '',
+                        day_status if ride_number == 1 else '',
+                    ]
 
                     row_fill = full_fill if day_status == 'Full' else half_fill
                     for col, val in enumerate(data, 1):
@@ -845,9 +901,10 @@ def export_excel(request):
                         cell.border = border
                         cell.fill = row_fill
                     row_idx += 1
-                total_salary += day_salary
-            else:
-                # No rides: Leave or Holiday
+                if not scoped_filters:
+                    total_salary += day_salary
+            elif not scoped_filters:
+                # No rides: Leave or Holiday (only when not company/vehicle scoped)
                 if is_weekend:
                     day_label = 'Holiday'
                     row_fill = holiday_fill
@@ -1018,6 +1075,8 @@ def export_excel(request):
         all_rides_qs = all_rides_qs.filter(driver_id=driver_id)
     if company_id:
         all_rides_qs = all_rides_qs.filter(company_id=company_id)
+    if vehicle_number:
+        all_rides_qs = all_rides_qs.filter(vehicle_number=vehicle_number)
 
     all_rides_list = list(all_rides_qs.annotate(
         trip_type_order=Case(
