@@ -54,6 +54,45 @@ def make_unique_sheet_title(name, used_titles, fallback='Sheet'):
     return temp
 
 
+def ride_dedupe_key(ride):
+    """Signature for duplicate ride rows (e.g. repeated offline sync entries)."""
+    route = (ride.route or ride.pickup or '').strip().lower()
+    return (
+        ride.driver_id,
+        ride.date,
+        ride.company_id,
+        str(ride.ride_time or ''),
+        (ride.trip_type or '').strip(),
+        route,
+        (ride.vehicle_number or '').strip(),
+        str(ride.total_km or ''),
+    )
+
+
+def dedupe_ride_list(rides):
+    seen = set()
+    unique = []
+    for ride in rides:
+        key = ride_dedupe_key(ride)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ride)
+    return unique
+
+
+def count_deduped_rides(qs):
+    seen = set()
+    count = 0
+    for ride in qs.iterator():
+        key = ride_dedupe_key(ride)
+        if key in seen:
+            continue
+        seen.add(key)
+        count += 1
+    return count
+
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
@@ -595,19 +634,23 @@ def admin_dashboard(request):
         'reason': a.reason,
     } for a in paid_advances.order_by('-resolved_date')]
 
-    # Company breakdown
-    company_stats = ride_qs.values('company__name').annotate(
-        count=Count('id'),
-        total_km=Sum('total_km')
-    ).order_by('-count')
-    
-    company_breakdown = []
-    for item in company_stats:
-        company_breakdown.append({
-            'name': item['company__name'] or 'Other',
-            'count': item['count'],
-            'total_km': float(item['total_km'] or 0)
-        })
+    # Company breakdown (deduped to avoid inflated counts from duplicate sync rows)
+    company_breakdown_map = {}
+    for ride in dedupe_ride_list(list(ride_qs.select_related('company'))):
+        name = ride.company.name if ride.company else 'Other'
+        if name not in company_breakdown_map:
+            company_breakdown_map[name] = {'count': 0, 'total_km': 0.0}
+        company_breakdown_map[name]['count'] += 1
+        company_breakdown_map[name]['total_km'] += float(ride.total_km or 0)
+
+    company_breakdown = [
+        {
+            'name': name,
+            'count': data['count'],
+            'total_km': data['total_km'],
+        }
+        for name, data in sorted(company_breakdown_map.items(), key=lambda x: -x[1]['count'])
+    ]
 
     # Charging stats
     charge_qs = CarCharge.objects.all()
@@ -637,7 +680,7 @@ def admin_dashboard(request):
         total_active_drivers = Driver.objects.filter(is_active=True).count()
 
     return Response({
-        'total_rides': ride_qs.count(),
+        'total_rides': count_deduped_rides(ride_qs),
         'total_drivers': total_active_drivers,
         'drivers_target_achieved': drivers_target_achieved,
         'total_half_days': stats_agg['total_half_days'] or 0,
@@ -691,10 +734,11 @@ def reports(request):
             day_rides = rides_base.filter(driver_id=driver_id_val, date=ride_date).order_by(
                 'ride_time', 'created_at'
             )
-            rides = RideSerializer(day_rides, many=True).data
+            day_rides_unique = dedupe_ride_list(list(day_rides))
+            rides = RideSerializer(day_rides_unique, many=True).data
             if not rides:
                 continue
-            driver = att.driver if att else day_rides.first().driver
+            driver = att.driver if att else day_rides_unique[0].driver
             results.append({
                 'driver_name': driver.name,
                 'driver_id': driver_id_val,
@@ -719,12 +763,15 @@ def reports(request):
         rides_qs = Ride.objects.select_related('company').filter(driver=att.driver, date=att.date)
         if vehicle_number:
             rides_qs = rides_qs.filter(vehicle_number=vehicle_number)
-        rides = RideSerializer(rides_qs.order_by('ride_time', 'created_at'), many=True).data
+        rides_unique = dedupe_ride_list(list(rides_qs.order_by('ride_time', 'created_at')))
+        rides = RideSerializer(rides_unique, many=True).data
+        if vehicle_number and not rides:
+            continue
         results.append({
             'driver_name': att.driver.name,
             'driver_id': att.driver_id,
             'date': att.date,
-            'total_rides': att.total_rides,
+            'total_rides': len(rides) if vehicle_number else att.total_rides,
             'status': att.status,
             'salary': att.salary,
             'rides': rides,
@@ -874,6 +921,7 @@ def export_excel(request):
             if vehicle_number:
                 rides_qs = rides_qs.filter(vehicle_number=vehicle_number)
             rides = list(rides_qs.order_by('ride_time', 'created_at'))
+            rides = dedupe_ride_list(rides)
 
             if rides:
                 day_status = att.status if att else ''
@@ -1078,14 +1126,14 @@ def export_excel(request):
     if vehicle_number:
         all_rides_qs = all_rides_qs.filter(vehicle_number=vehicle_number)
 
-    all_rides_list = list(all_rides_qs.annotate(
+    all_rides_list = dedupe_ride_list(list(all_rides_qs.annotate(
         trip_type_order=Case(
             When(trip_type='P', then=Value(0)),
             When(trip_type='D', then=Value(1)),
             default=Value(2),
             output_field=IntegerField(),
         )
-    ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
+    ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at')))
 
     if all_rides_list:
         rides_fill = PatternFill(start_color='1B5E20', end_color='1B5E20', fill_type='solid')
