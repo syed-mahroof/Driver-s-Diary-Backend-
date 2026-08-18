@@ -13,6 +13,7 @@ urlpatterns = [
 
     # Driver
     path('driver/dashboard/', views.driver_dashboard, name='driver_dashboard'),
+    path('driver/salary-summary/', views.driver_salary_summary, name='driver_salary_summary'),
     path('driver/export-excel/', views.export_driver_excel, name='export_driver_excel'),
     path('driver/report-data/', views.driver_report_data, name='driver_report_data'),
     path('driver/charge/', views.create_car_charge, name='create_car_charge'),
@@ -29,6 +30,7 @@ urlpatterns = [
 
     # Admin
     path('admin/dashboard/', views.admin_dashboard, name='admin_dashboard'),
+    path('admin/salary-summary/', views.admin_salary_summary, name='admin_salary_summary'),
     path('admin/drivers/', views.list_drivers, name='list_drivers'),
     path('admin/drivers/create/', views.create_driver, name='create_driver'),
     path('admin/charge/create/', views.admin_create_car_charge, name='admin_create_car_charge'),

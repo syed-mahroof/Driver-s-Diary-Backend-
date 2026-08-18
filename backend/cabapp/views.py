@@ -30,6 +30,111 @@ def get_cycle_end_year_month(ref_date):
         return ref_date.year, ref_date.month + 1
     return ref_date.year, ref_date.month
 
+
+# Salary is earned against the same ride-based rules shown in the driver's live
+# earnings tracker. Keeping the calculation here means the driver statement,
+# the admin overview, and their PDFs all use one authoritative result.
+SALARY_TARGET_TRIPS = 120
+SALARY_TARGET_AMOUNT = 20000
+SALARY_BASE_TRIP_VALUE = SALARY_TARGET_AMOUNT / SALARY_TARGET_TRIPS
+SALARY_INCENTIVE_TRIP_VALUE = 200
+SALARY_SPECIAL_KM_RATE = 3.5
+
+
+def get_current_and_previous_salary_cycles(ref_date=None):
+    """Return the active 16th-to-15th cycle and the immediately prior one."""
+    ref_date = ref_date or date.today()
+    cycle_end_year, cycle_end_month = get_cycle_end_year_month(ref_date)
+    current_start, current_end = get_trailing_month_range(cycle_end_year, cycle_end_month)
+
+    previous_reference = current_start - timedelta(days=1)
+    previous_end_year, previous_end_month = get_cycle_end_year_month(previous_reference)
+    previous_start, previous_end = get_trailing_month_range(previous_end_year, previous_end_month)
+
+    return (current_start, current_end), (previous_start, previous_end)
+
+
+def build_salary_cycle_summaries(drivers, cycle_start, cycle_end):
+    """Build efficient, per-driver salary summaries for one salary cycle."""
+    driver_ids = [driver.id for driver in drivers]
+    if not driver_ids:
+        return {}
+
+    special_company_q = (
+        Q(company__name__icontains='zellis') |
+        Q(company__name__icontains='dodge')
+    )
+
+    ride_data = {
+        row['driver_id']: row
+        for row in Ride.objects.filter(
+            driver_id__in=driver_ids,
+            date__gte=cycle_start,
+            date__lte=cycle_end,
+        ).values('driver_id').annotate(
+            total_rides=Count('id'),
+            standard_rides=Count('id', filter=~special_company_q),
+            special_kms=Sum('total_km', filter=special_company_q),
+        )
+    }
+
+    attendance_data = {driver_id: {'Full': 0, 'Half': 0, 'Leave': 0, 'Holiday': 0} for driver_id in driver_ids}
+    for row in Attendance.objects.filter(
+        driver_id__in=driver_ids,
+        date__gte=cycle_start,
+        date__lte=cycle_end,
+    ).values('driver_id', 'status').annotate(count=Count('id')):
+        attendance_data[row['driver_id']][row['status']] = row['count']
+
+    advance_data = {
+        row['driver_id']: float(row['total'] or 0)
+        for row in AdvanceSalaryRequest.objects.filter(
+            driver_id__in=driver_ids,
+            status='Paid',
+            resolved_date__date__gte=cycle_start,
+            resolved_date__date__lte=cycle_end,
+        ).values('driver_id').annotate(total=Sum('amount'))
+    }
+
+    summaries = {}
+    for driver in drivers:
+        rides = ride_data.get(driver.id, {})
+        total_rides = int(rides.get('total_rides') or 0)
+        standard_rides = int(rides.get('standard_rides') or 0)
+        special_kms = float(rides.get('special_kms') or 0)
+        incentive_trips = max(0, standard_rides - SALARY_TARGET_TRIPS)
+
+        standard_ride_earnings = round(standard_rides * SALARY_BASE_TRIP_VALUE, 2)
+        distance_earnings = round(special_kms * SALARY_SPECIAL_KM_RATE, 2)
+        incentive_earnings = round(incentive_trips * SALARY_INCENTIVE_TRIP_VALUE, 2)
+        gross_earnings = round(standard_ride_earnings + distance_earnings + incentive_earnings, 2)
+        advance_paid = round(advance_data.get(driver.id, 0), 2)
+
+        attendance = attendance_data[driver.id]
+        summaries[driver.id] = {
+            'cycle_start': cycle_start.isoformat(),
+            'cycle_end': cycle_end.isoformat(),
+            'total_rides': total_rides,
+            'standard_rides': standard_rides,
+            'special_rides': total_rides - standard_rides,
+            'special_kms': round(special_kms, 2),
+            'standard_ride_earnings': standard_ride_earnings,
+            'distance_earnings': distance_earnings,
+            'incentive_trips': incentive_trips,
+            'incentive_earnings': incentive_earnings,
+            'gross_earnings': gross_earnings,
+            'advance_paid': advance_paid,
+            'net_payable': round(gross_earnings - advance_paid, 2),
+            'attendance': {
+                'full_days': attendance['Full'],
+                'half_days': attendance['Half'],
+                'leaves': attendance['Leave'],
+                'holidays': attendance['Holiday'],
+            },
+        }
+
+    return summaries
+
 def is_full_month(d_start, d_end):
     if not d_start or not d_end:
         return False
@@ -398,6 +503,33 @@ def driver_dashboard(request):
     })
 
 
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def driver_salary_summary(request):
+    """Previous and in-progress salary-cycle figures for the signed-in driver."""
+    try:
+        driver = request.user.driver_profile
+    except Driver.DoesNotExist:
+        return Response({'error': 'Driver profile not found'}, status=404)
+
+    (current_start, current_end), (previous_start, previous_end) = get_current_and_previous_salary_cycles()
+    current_summary = build_salary_cycle_summaries([driver], current_start, current_end)[driver.id]
+    previous_summary = build_salary_cycle_summaries([driver], previous_start, previous_end)[driver.id]
+
+    return Response({
+        'driver_id': driver.id,
+        'driver_name': driver.name,
+        'salary_rules': {
+            'standard_ride_rate': round(SALARY_BASE_TRIP_VALUE, 2),
+            'special_km_rate': SALARY_SPECIAL_KM_RATE,
+            'incentive_trip_rate': SALARY_INCENTIVE_TRIP_VALUE,
+            'incentive_threshold': SALARY_TARGET_TRIPS,
+        },
+        'previous_cycle': previous_summary,
+        'current_cycle': current_summary,
+    })
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
 def create_ride(request):
@@ -693,6 +825,57 @@ def admin_dashboard(request):
         'company_breakdown': company_breakdown,
         'total_charging_cost': total_charging_cost,
         'charging_details': charge_list,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def admin_salary_summary(request):
+    """All active drivers' current and previous salary-cycle earnings."""
+    if not (request.user.is_staff or request.user.is_superuser):
+        return Response({'error': 'Admin access required'}, status=403)
+
+    drivers = list(Driver.objects.filter(is_active=True).order_by('name'))
+    (current_start, current_end), (previous_start, previous_end) = get_current_and_previous_salary_cycles()
+    current_summaries = build_salary_cycle_summaries(drivers, current_start, current_end)
+    previous_summaries = build_salary_cycle_summaries(drivers, previous_start, previous_end)
+
+    rows = [
+        {
+            'driver_id': driver.id,
+            'driver_name': driver.name,
+            'previous_cycle': previous_summaries[driver.id],
+            'current_cycle': current_summaries[driver.id],
+        }
+        for driver in drivers
+    ]
+
+    def cycle_totals(summaries):
+        return {
+            'gross_earnings': round(sum(summary['gross_earnings'] for summary in summaries.values()), 2),
+            'advance_paid': round(sum(summary['advance_paid'] for summary in summaries.values()), 2),
+            'net_payable': round(sum(summary['net_payable'] for summary in summaries.values()), 2),
+            'total_rides': sum(summary['total_rides'] for summary in summaries.values()),
+        }
+
+    return Response({
+        'salary_rules': {
+            'standard_ride_rate': round(SALARY_BASE_TRIP_VALUE, 2),
+            'special_km_rate': SALARY_SPECIAL_KM_RATE,
+            'incentive_trip_rate': SALARY_INCENTIVE_TRIP_VALUE,
+            'incentive_threshold': SALARY_TARGET_TRIPS,
+        },
+        'previous_cycle': {
+            'cycle_start': previous_start.isoformat(),
+            'cycle_end': previous_end.isoformat(),
+            'totals': cycle_totals(previous_summaries),
+        },
+        'current_cycle': {
+            'cycle_start': current_start.isoformat(),
+            'cycle_end': current_end.isoformat(),
+            'totals': cycle_totals(current_summaries),
+        },
+        'drivers': rows,
     })
 
 
