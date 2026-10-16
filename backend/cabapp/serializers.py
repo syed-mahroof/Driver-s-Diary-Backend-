@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth.models import User
 from django.db import transaction
+from decimal import Decimal
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import Driver, Company, Ride, Attendance, CarCharge, Vehicle, AdvanceSalaryRequest
 
@@ -84,6 +85,8 @@ class RideSerializer(serializers.ModelSerializer):
 
 
 class RideCreateSerializer(serializers.ModelSerializer):
+    total_km = serializers.DecimalField(max_digits=7, decimal_places=2, min_value=Decimal('0'), allow_null=True, required=False)
+    requested_seater = serializers.ChoiceField(choices=[4, 6], required=False)
     class Meta:
         model = Ride
         fields = ['local_id', 'company', 'date', 'ride_time', 'trip_type', 'route',
@@ -110,9 +113,9 @@ class SyncRideSerializer(serializers.Serializer):
     pickup = serializers.CharField(max_length=500, required=False, allow_blank=True)
     drop = serializers.CharField(max_length=500, required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
-    total_km = serializers.DecimalField(max_digits=7, decimal_places=2, required=False, allow_null=True)
+    total_km = serializers.DecimalField(max_digits=7, decimal_places=2, min_value=Decimal('0'), required=False, allow_null=True)
     vehicle_number = serializers.CharField(max_length=50, required=False, allow_blank=True)
-    requested_seater = serializers.IntegerField(required=False, default=4)
+    requested_seater = serializers.ChoiceField(choices=[4, 6], required=False, default=4)
 
 
 class SyncPayloadSerializer(serializers.Serializer):
@@ -172,6 +175,7 @@ class ResetPasswordSerializer(serializers.Serializer):
 
 
 class CarChargeSerializer(serializers.ModelSerializer):
+    charge_amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
     class Meta:
         model = CarCharge
         fields = ['id', 'driver', 'date', 'app_used', 'time', 'place', 'vehicle_number', 'charge_amount', 'created_at']
@@ -183,11 +187,6 @@ class CarChargeSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
 
-class AdminCarChargeSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CarCharge
-        fields = ['id', 'driver', 'date', 'app_used', 'time', 'place', 'vehicle_number', 'charge_amount', 'created_at']
-        read_only_fields = ['id', 'created_at']
 class VehicleSerializer(serializers.ModelSerializer):
     class Meta:
         model = Vehicle
@@ -195,6 +194,7 @@ class VehicleSerializer(serializers.ModelSerializer):
 
 
 class AdvanceSalaryRequestSerializer(serializers.ModelSerializer):
+    amount = serializers.DecimalField(max_digits=10, decimal_places=2, min_value=Decimal('0.01'))
     driver_name = serializers.CharField(source='driver.name', read_only=True)
 
     class Meta:

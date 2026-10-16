@@ -5,10 +5,9 @@ from django.db import transaction
 from django.db.models import Count, Sum, Q, Case, When, Value, IntegerField
 from django.http import HttpResponse
 from django.conf import settings
-from rest_framework import status, generics
+from rest_framework import status
 
 import calendar
-from datetime import date, timedelta
 
 def get_trailing_month_range(year, month):
     """Salary cycle ending on the 15th of (year, month): runs 16th of the
@@ -186,18 +185,6 @@ def dedupe_ride_list(rides):
     return unique
 
 
-def count_deduped_rides(qs):
-    seen = set()
-    count = 0
-    for ride in qs.iterator():
-        key = ride_dedupe_key(ride)
-        if key in seen:
-            continue
-        seen.add(key)
-        count += 1
-    return count
-
-
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework.response import Response
@@ -210,13 +197,13 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from .models import Driver, Company, Ride, Attendance, PasswordResetOTP, Vehicle, CarCharge, AdvanceSalaryRequest
+from .filters import admin_filters
 from .serializers import (
     CompanySerializer, RideSerializer, RideCreateSerializer,
-    SyncPayloadSerializer, AttendanceSerializer, DriverSerializer,
+    SyncPayloadSerializer, DriverSerializer,
     RegisterSerializer, UserSerializer, CabTokenObtainPairSerializer,
     ForgotPasswordRequestSerializer, VerifyOTPSerializer, ResetPasswordSerializer,
     CarChargeSerializer, VehicleSerializer, AdvanceSalaryRequestSerializer,
-    AdminCarChargeSerializer
 )
 
 
@@ -426,10 +413,10 @@ def driver_dashboard(request):
     today_count = today_rides_qs.count()
 
     is_full = today_count >= threshold
-    current_salary = full_rate if is_full else half_rate
+    current_salary = 0 if today.weekday() >= 5 or today_count == 0 else full_rate if is_full else half_rate
 
     recent_rides = RideSerializer(
-        today_rides_qs.select_related('company').order_by('-created_at')[:10],
+        today_rides_qs.select_related('company', 'driver').order_by('-created_at')[:10],
         many=True
     ).data
 
@@ -480,7 +467,7 @@ def driver_dashboard(request):
         'driver_name': driver.name,
         'today_rides': today_count,
         'target_rides': threshold,
-        'status': 'Full Day' if is_full else 'Half Day',
+        'status': 'Holiday' if today.weekday() >= 5 else 'Leave' if today_count == 0 else 'Full Day' if is_full else 'Half Day',
         'salary_today': current_salary,
         'progress_percentage': min(100, (today_count / threshold) * 100),
         'recent_rides': recent_rides,
@@ -538,14 +525,11 @@ def create_ride(request):
     except Driver.DoesNotExist:
         return Response({'error': 'Driver profile not found'}, status=404)
 
+    existing = Ride.objects.filter(local_id=request.data.get('local_id'), driver=driver).first()
+    if existing:
+        return Response(RideSerializer(existing).data)
     serializer = RideCreateSerializer(data=request.data, context={'request': request})
     if serializer.is_valid():
-        # Check for duplicate local_id
-        local_id = request.data.get('local_id')
-        if local_id and Ride.objects.filter(local_id=local_id).exists():
-            ride = Ride.objects.get(local_id=local_id)
-            return Response(RideSerializer(ride).data, status=status.HTTP_200_OK)
-
         ride = serializer.save()
         update_attendance(driver, ride.date)
         return Response(RideSerializer(ride).data, status=status.HTTP_201_CREATED)
@@ -613,8 +597,12 @@ def sync_rides(request):
         for ride_data in rides_data:
             local_id = ride_data['local_id']
 
-            if Ride.objects.filter(local_id=local_id).exists():
-                results['skipped'].append(local_id)
+            existing = Ride.objects.filter(local_id=local_id).first()
+            if existing:
+                if existing.driver_id == driver.pk:
+                    results['skipped'].append(local_id)
+                else:
+                    results['errors'].append({'local_id': local_id, 'error': 'Ride ID is unavailable.'})
                 continue
 
             try:
@@ -635,6 +623,7 @@ def sync_rides(request):
                     notes=ride_data.get('notes', ''),
                     total_km=ride_data.get('total_km'),
                     vehicle_number=ride_data.get('vehicle_number', ''),
+                    requested_seater=ride_data.get('requested_seater', 4),
                 )
                 results['synced'].append(local_id)
                 update_attendance(driver, ride.date)
@@ -664,30 +653,6 @@ def create_company(request):
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def create_driver(request):
-    serializer = RegisterSerializer(data=request.data)
-    if serializer.is_valid():
-        user = serializer.save()
-        # We don't need to return tokens here as this is for admin to create drivers
-        return Response({
-            'user': UserSerializer(user).data,
-            'driver': DriverSerializer(user.driver_profile).data
-        }, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
-@api_view(['POST'])
-@permission_classes([IsAdminUser])
-def admin_create_car_charge(request):
-    serializer = AdminCarChargeSerializer(data=request.data)
-    if serializer.is_valid():
-        charge = serializer.save()
-        return Response(AdminCarChargeSerializer(charge).data, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def admin_dashboard(request):
@@ -695,11 +660,7 @@ def admin_dashboard(request):
         return Response({'error': 'Admin access required'}, status=403)
 
     # Parse filters
-    start_date = request.query_params.get('start_date')
-    end_date = request.query_params.get('end_date')
-    driver_id = request.query_params.get('driver_id')
-    company_id = request.query_params.get('company_id')
-    vehicle_number = request.query_params.get('vehicle_number')
+    start_date, end_date, driver_id, company_id, vehicle_number = admin_filters(request.query_params)
 
     attendance_qs = Attendance.objects.all()
     ride_qs = Ride.objects.all()
@@ -711,12 +672,12 @@ def admin_dashboard(request):
         attendance_qs = attendance_qs.filter(date__lte=end_date)
         ride_qs = ride_qs.filter(date__lte=end_date)
     if driver_id:
-        attendance_qs = attendance_qs.filter(driver_id=driver_id)
-        ride_qs = ride_qs.filter(driver_id=driver_id)
+        attendance_qs = attendance_qs.filter(driver_id__in=driver_id)
+        ride_qs = ride_qs.filter(driver_id__in=driver_id)
     if company_id:
-        ride_qs = ride_qs.filter(company_id=company_id)
+        ride_qs = ride_qs.filter(company_id__in=company_id)
     if vehicle_number:
-        ride_qs = ride_qs.filter(vehicle_number=vehicle_number)
+        ride_qs = ride_qs.filter(vehicle_number__in=vehicle_number)
         # Align attendance to drivers who actually drove this vehicle in range
         vehicle_driver_ids = ride_qs.values_list('driver_id', flat=True).distinct()
         attendance_qs = attendance_qs.filter(driver_id__in=vehicle_driver_ids)
@@ -735,7 +696,7 @@ def admin_dashboard(request):
         salary_start, salary_end = get_trailing_month_range(d_end_parsed.year, d_end_parsed.month)
         sal_qs = Attendance.objects.filter(date__gte=salary_start, date__lte=salary_end)
         if driver_id:
-            sal_qs = sal_qs.filter(driver_id=driver_id)
+            sal_qs = sal_qs.filter(driver_id__in=driver_id)
         stats_agg['total_salary'] = sal_qs.aggregate(total_salary=Sum('salary'))['total_salary']
     else:
         stats_agg['total_salary'] = attendance_qs.aggregate(total_salary=Sum('salary'))['total_salary']
@@ -744,7 +705,7 @@ def admin_dashboard(request):
     # Advance salary stats
     advance_qs = AdvanceSalaryRequest.objects.select_related('driver').all()
     if driver_id:
-        advance_qs = advance_qs.filter(driver_id=driver_id)
+        advance_qs = advance_qs.filter(driver_id__in=driver_id)
     
     # Notification count should show all pending requests for visibility
     pending_advance_count = advance_qs.filter(status='Pending').count()
@@ -768,7 +729,8 @@ def admin_dashboard(request):
 
     # Company breakdown (deduped to avoid inflated counts from duplicate sync rows)
     company_breakdown_map = {}
-    for ride in dedupe_ride_list(list(ride_qs.select_related('company'))):
+    unique_rides = dedupe_ride_list(list(ride_qs.select_related('company')))
+    for ride in unique_rides:
         name = ride.company.name if ride.company else 'Other'
         if name not in company_breakdown_map:
             company_breakdown_map[name] = {'count': 0, 'total_km': 0.0}
@@ -788,8 +750,8 @@ def admin_dashboard(request):
     charge_qs = CarCharge.objects.all()
     if start_date: charge_qs = charge_qs.filter(date__gte=start_date)
     if end_date: charge_qs = charge_qs.filter(date__lte=end_date)
-    if driver_id: charge_qs = charge_qs.filter(driver_id=driver_id)
-    if vehicle_number: charge_qs = charge_qs.filter(vehicle_number=vehicle_number)
+    if driver_id: charge_qs = charge_qs.filter(driver_id__in=driver_id)
+    if vehicle_number: charge_qs = charge_qs.filter(vehicle_number__in=vehicle_number)
     total_charging_cost = float(charge_qs.aggregate(total=Sum('charge_amount'))['total'] or 0)
 
     charge_list = [{
@@ -797,7 +759,8 @@ def admin_dashboard(request):
         'driver_name': c.driver.name if c.driver else 'No Driver',
         'date': c.date.strftime('%Y-%m-%d'),
         'app_used': c.app_used,
-        'time': c.time.strftime('%I:%M %p').lstrip('0') if c.time else '',
+        'time': c.time.isoformat() if c.time else '',
+        'driver': c.driver_id,
         'place': c.place,
         'vehicle_number': c.vehicle_number,
         'charge_amount': float(c.charge_amount),
@@ -812,7 +775,7 @@ def admin_dashboard(request):
         total_active_drivers = Driver.objects.filter(is_active=True).count()
 
     return Response({
-        'total_rides': count_deduped_rides(ride_qs),
+        'total_rides': len(unique_rides),
         'total_drivers': total_active_drivers,
         'drivers_target_achieved': drivers_target_achieved,
         'total_half_days': stats_agg['total_half_days'] or 0,
@@ -885,81 +848,32 @@ def reports(request):
     if not (request.user.is_staff or request.user.is_superuser):
         return Response({'error': 'Admin access required'}, status=403)
 
-    start_date = request.query_params.get('start_date')
-    end_date = request.query_params.get('end_date')
-    driver_id = request.query_params.get('driver_id')
-    company_id = request.query_params.get('company_id')
-    vehicle_number = request.query_params.get('vehicle_number')
+    start_date, end_date, driver_id, company_id, vehicle_number = admin_filters(request.query_params)
 
-    # Prefer ride-centric filtering so company/vehicle filters only return matching rides
-    rides_base = Ride.objects.select_related('company', 'driver')
+    from .filters import scope_rides
+    rides = scope_rides(Ride.objects.select_related('company', 'driver'), start_date, end_date, driver_id, company_id, vehicle_number)
+    grouped = {}
+    for ride in dedupe_ride_list(list(rides.order_by('-date', 'driver__name', 'ride_time', 'created_at'))):
+        grouped.setdefault((ride.driver_id, ride.date), []).append(ride)
+    attendance = Attendance.objects.select_related('driver')
     if start_date:
-        rides_base = rides_base.filter(date__gte=start_date)
+        attendance = attendance.filter(date__gte=start_date)
     if end_date:
-        rides_base = rides_base.filter(date__lte=end_date)
+        attendance = attendance.filter(date__lte=end_date)
     if driver_id:
-        rides_base = rides_base.filter(driver_id=driver_id)
-    if company_id:
-        rides_base = rides_base.filter(company_id=company_id)
-    if vehicle_number:
-        rides_base = rides_base.filter(vehicle_number=vehicle_number)
-
-    # Company / vehicle filters: only days that actually have matching rides
-    if company_id or vehicle_number:
-        # Only days that actually have matching rides
-        pairs = list(rides_base.values_list('driver_id', 'date').distinct())
-        pairs.sort(key=lambda item: (item[1], item[0]), reverse=True)
-        results = []
-        for driver_id_val, ride_date in pairs:
-            att = Attendance.objects.select_related('driver').filter(
-                driver_id=driver_id_val, date=ride_date
-            ).first()
-            day_rides = rides_base.filter(driver_id=driver_id_val, date=ride_date).order_by(
-                'ride_time', 'created_at'
-            )
-            day_rides_unique = dedupe_ride_list(list(day_rides))
-            rides = RideSerializer(day_rides_unique, many=True).data
-            if not rides:
-                continue
-            driver = att.driver if att else day_rides_unique[0].driver
-            results.append({
-                'driver_name': driver.name,
-                'driver_id': driver_id_val,
-                'date': ride_date,
-                'total_rides': len(rides),
-                'status': att.status if att else '',
-                'salary': att.salary if att else 0,
-                'rides': rides,
-            })
-        return Response(results)
-
-    qs = Attendance.objects.select_related('driver').all()
-    if start_date:
-        qs = qs.filter(date__gte=start_date)
-    if end_date:
-        qs = qs.filter(date__lte=end_date)
-    if driver_id:
-        qs = qs.filter(driver_id=driver_id)
-
+        attendance = attendance.filter(driver_id__in=driver_id)
+    attendance_map = {(row.driver_id, row.date): row for row in attendance}
+    keys = set(grouped) if company_id or vehicle_number else set(grouped) | set(attendance_map)
     results = []
-    for att in qs.order_by('-date', 'driver__name'):
-        rides_qs = Ride.objects.select_related('company').filter(driver=att.driver, date=att.date)
-        if vehicle_number:
-            rides_qs = rides_qs.filter(vehicle_number=vehicle_number)
-        rides_unique = dedupe_ride_list(list(rides_qs.order_by('ride_time', 'created_at')))
-        rides = RideSerializer(rides_unique, many=True).data
-        if vehicle_number and not rides:
-            continue
+    for key in sorted(keys, key=lambda value: (value[1], -value[0]), reverse=True):
+        day_rides = grouped.get(key, [])
+        att = attendance_map.get(key)
+        driver = att.driver if att else day_rides[0].driver
         results.append({
-            'driver_name': att.driver.name,
-            'driver_id': att.driver_id,
-            'date': att.date,
-            'total_rides': len(rides) if vehicle_number else att.total_rides,
-            'status': att.status,
-            'salary': att.salary,
-            'rides': rides,
+            'driver_name': driver.name, 'driver_id': driver.pk, 'date': key[1],
+            'total_rides': len(day_rides), 'status': att.status if att else '',
+            'salary': att.salary if att else 0, 'rides': RideSerializer(day_rides, many=True).data,
         })
-
     return Response(results)
 
 
@@ -969,11 +883,7 @@ def export_excel(request):
     if not (request.user.is_staff or request.user.is_superuser):
         return Response({'error': 'Admin access required'}, status=403)
 
-    start_date_str = request.query_params.get('start_date')
-    end_date_str = request.query_params.get('end_date')
-    driver_id = request.query_params.get('driver_id')
-    company_id = request.query_params.get('company_id')
-    vehicle_number = request.query_params.get('vehicle_number')
+    start_date_str, end_date_str, driver_id, company_id, vehicle_number = admin_filters(request.query_params)
 
     # Parse date range
     try:
@@ -995,14 +905,14 @@ def export_excel(request):
     # Get drivers to include
     rides_scope = Ride.objects.filter(date__gte=d_start, date__lte=d_end)
     if driver_id:
-        rides_scope = rides_scope.filter(driver_id=driver_id)
+        rides_scope = rides_scope.filter(driver_id__in=driver_id)
     if company_id:
-        rides_scope = rides_scope.filter(company_id=company_id)
+        rides_scope = rides_scope.filter(company_id__in=company_id)
     if vehicle_number:
-        rides_scope = rides_scope.filter(vehicle_number=vehicle_number)
+        rides_scope = rides_scope.filter(vehicle_number__in=vehicle_number)
 
     if driver_id:
-        target_drivers = list(Driver.objects.filter(id=driver_id, is_active=True))
+        target_drivers = list(Driver.objects.filter(id__in=driver_id))
     elif scoped_filters:
         driver_ids = rides_scope.values_list('driver_id', flat=True).distinct()
         target_drivers = list(Driver.objects.filter(id__in=driver_ids, is_active=True).order_by('name'))
@@ -1014,7 +924,7 @@ def export_excel(request):
         date__gte=d_start, date__lte=d_end
     )
     if driver_id:
-        att_qs = att_qs.filter(driver_id=driver_id)
+        att_qs = att_qs.filter(driver_id__in=driver_id)
     elif scoped_filters:
         att_qs = att_qs.filter(driver_id__in=[d.id for d in target_drivers])
 
@@ -1026,9 +936,9 @@ def export_excel(request):
     # Fetch charges for the period
     charge_qs_all = CarCharge.objects.filter(date__gte=d_start, date__lte=d_end)
     if driver_id:
-        charge_qs_all = charge_qs_all.filter(driver_id=driver_id)
+        charge_qs_all = charge_qs_all.filter(driver_id__in=driver_id)
     if vehicle_number:
-        charge_qs_all = charge_qs_all.filter(vehicle_number=vehicle_number)
+        charge_qs_all = charge_qs_all.filter(vehicle_number__in=vehicle_number)
 
     # Fetch advance salary requests (Paid) for the period
     advance_qs_all = AdvanceSalaryRequest.objects.filter(
@@ -1037,7 +947,7 @@ def export_excel(request):
         resolved_date__date__lte=d_end,
     )
     if driver_id:
-        advance_qs_all = advance_qs_all.filter(driver_id=driver_id)
+        advance_qs_all = advance_qs_all.filter(driver_id__in=driver_id)
 
     full_rate = getattr(settings, 'FULL_DAY_RATE', 1000)
     half_rate = getattr(settings, 'HALF_DAY_RATE', 500)
@@ -1061,6 +971,22 @@ def export_excel(request):
     half_fill = PatternFill(start_color='FFF9C4', end_color='FFF9C4', fill_type='solid')
     leave_fill = PatternFill(start_color='FFCDD2', end_color='FFCDD2', fill_type='solid')
     holiday_fill = PatternFill(start_color='E0E0E0', end_color='E0E0E0', fill_type='solid')
+
+    rides_by_day = {}
+    for ride in dedupe_ride_list(list(rides_scope.select_related('company', 'driver').order_by('ride_time', 'created_at'))):
+        rides_by_day.setdefault((ride.driver_id, ride.date), []).append(ride)
+    charges_by_driver = {}
+    for charge in charge_qs_all:
+        charges_by_driver.setdefault(charge.driver_id, []).append(charge)
+    advances_by_driver = {}
+    for advance in advance_qs_all:
+        advances_by_driver.setdefault(advance.driver_id, []).append(advance)
+    cycle_salary = {}
+    if is_full_month(d_start, d_end):
+        salary_start, salary_end = get_trailing_month_range(d_end.year, d_end.month)
+        cycle_salary = {row['driver_id']: row['total'] for row in Attendance.objects.filter(
+            driver_id__in=[driver.id for driver in target_drivers], date__range=(salary_start, salary_end)
+        ).order_by().values('driver_id').annotate(total=Sum('salary'))}
 
     used_sheet_titles = set()
     first = True
@@ -1098,13 +1024,7 @@ def export_excel(request):
             att = att_lookup.get((drv.id, d))
             is_weekend = d.weekday() in (5, 6)
 
-            rides_qs = Ride.objects.select_related('company').filter(driver=drv, date=d)
-            if company_id:
-                rides_qs = rides_qs.filter(company_id=company_id)
-            if vehicle_number:
-                rides_qs = rides_qs.filter(vehicle_number=vehicle_number)
-            rides = list(rides_qs.order_by('ride_time', 'created_at'))
-            rides = dedupe_ride_list(rides)
+            rides = rides_by_day.get((drv.id, d), [])
 
             if rides:
                 day_status = att.status if att else ''
@@ -1157,8 +1077,7 @@ def export_excel(request):
         ws.cell(row=total_row, column=2, value=total_rides_count).font = Font(bold=True)
         if is_full_month(d_start, d_end):
             salary_start, salary_end = get_trailing_month_range(d_end.year, d_end.month)
-            sal_qs = Attendance.objects.filter(driver_id=drv.id, date__gte=salary_start, date__lte=salary_end)
-            total_salary = sal_qs.aggregate(t=Sum('salary'))['t'] or 0
+            total_salary = cycle_salary.get(drv.id, 0)
 
         ws.cell(row=total_row, column=7, value='TOTAL SALARY').font = Font(bold=True)
         ws.cell(row=total_row, column=9, value=total_salary).font = Font(bold=True)
@@ -1187,7 +1106,7 @@ def export_excel(request):
                 cell.alignment = center_align
                 cell.border = border
         
-        driver_charges = charge_qs_all.filter(driver=drv).order_by('date', 'time')
+        driver_charges = sorted(charges_by_driver.get(drv.id, []), key=lambda charge: (charge.date, charge.time))
         
         total_charges = 0
         crow_idx = 3
@@ -1216,7 +1135,7 @@ def export_excel(request):
         wsc.cell(row=total_charges_row, column=8, value=total_charges).font = Font(bold=True)
 
         # 3. Advance Salary on Rides Sheet
-        driver_advances = advance_qs_all.filter(driver=drv)
+        driver_advances = advances_by_driver.get(drv.id, [])
         total_advance = sum(float(a.amount) for a in driver_advances)
         
         # 4. Final Summary on Rides Sheet
@@ -1303,11 +1222,11 @@ def export_excel(request):
         date__gte=d_start, date__lte=d_end
     )
     if driver_id:
-        all_rides_qs = all_rides_qs.filter(driver_id=driver_id)
+        all_rides_qs = all_rides_qs.filter(driver_id__in=driver_id)
     if company_id:
-        all_rides_qs = all_rides_qs.filter(company_id=company_id)
+        all_rides_qs = all_rides_qs.filter(company_id__in=company_id)
     if vehicle_number:
-        all_rides_qs = all_rides_qs.filter(vehicle_number=vehicle_number)
+        all_rides_qs = all_rides_qs.filter(vehicle_number__in=vehicle_number)
 
     all_rides_list = dedupe_ride_list(list(all_rides_qs.annotate(
         trip_type_order=Case(
@@ -1689,7 +1608,9 @@ def export_driver_excel(request):
 def list_drivers(request):
     if not (request.user.is_staff or request.user.is_superuser):
         return Response({'error': 'Admin access required'}, status=403)
-    drivers = Driver.objects.filter(is_active=True).select_related('user')
+    drivers = Driver.objects.select_related('user')
+    if request.query_params.get('include_inactive') != 'true':
+        drivers = drivers.filter(is_active=True)
     return Response(DriverSerializer(drivers, many=True).data)
 
 
@@ -1714,10 +1635,12 @@ def driver_report_data(request):
     
     qs = qs.order_by('date')
     
+    rides_by_date = {}
+    for ride in Ride.objects.select_related('company', 'driver').filter(driver=driver, date__in=qs.values('date')).order_by('ride_time', 'created_at'):
+        rides_by_date.setdefault(ride.date, []).append(ride)
     results = []
     for att in qs:
-        rides_qs = Ride.objects.select_related('company').filter(driver=driver, date=att.date).order_by('ride_time', 'created_at')
-        rides = RideSerializer(rides_qs, many=True).data
+        rides = RideSerializer(rides_by_date.get(att.date, []), many=True).data
         results.append({
             'date': att.date,
             'status': att.status,
@@ -1778,17 +1701,9 @@ def request_advance_salary(request):
     except Driver.DoesNotExist:
         return Response({'error': 'Driver profile not found'}, status=404)
 
-    amount = request.data.get('amount')
-    reason = request.data.get('reason', '')
-
-    if not amount or float(amount) <= 0:
-        return Response({'error': 'Please enter a valid amount.'}, status=400)
-
-    advance = AdvanceSalaryRequest.objects.create(
-        driver=driver,
-        amount=amount,
-        reason=reason,
-    )
+    serializer = AdvanceSalaryRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    advance = serializer.save(driver=driver, status='Pending')
     return Response(
         AdvanceSalaryRequestSerializer(advance).data,
         status=status.HTTP_201_CREATED

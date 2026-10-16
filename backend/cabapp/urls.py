@@ -1,6 +1,7 @@
 from django.urls import path
 from rest_framework_simplejwt.views import TokenRefreshView
 from . import views
+from . import admin_actions, performance
 
 urlpatterns = [
     # Auth
@@ -32,8 +33,14 @@ urlpatterns = [
     path('admin/dashboard/', views.admin_dashboard, name='admin_dashboard'),
     path('admin/salary-summary/', views.admin_salary_summary, name='admin_salary_summary'),
     path('admin/drivers/', views.list_drivers, name='list_drivers'),
-    path('admin/drivers/create/', views.create_driver, name='create_driver'),
-    path('admin/charge/create/', views.admin_create_car_charge, name='admin_create_car_charge'),
+    path('admin/drivers/create/', admin_actions.create_driver, name='create_driver'),
+    path('admin/drivers/<int:pk>/', admin_actions.driver_detail, name='admin_driver_detail'),
+    path('admin/rides/create/', admin_actions.ride_detail, name='admin_create_ride'),
+    path('admin/rides/<int:pk>/', admin_actions.ride_detail, name='admin_update_ride'),
+    path('admin/charge/create/', admin_actions.charge_detail, name='admin_create_car_charge'),
+    path('admin/charge/<int:pk>/', admin_actions.charge_detail, name='admin_update_car_charge'),
+    path('admin/advance-salary/create/', admin_actions.create_advance, name='admin_create_advance'),
+    path('admin/performance/', performance.driver_performance, name='admin_performance'),
     path('companies/create/', views.create_company, name='create_company'),
     path('reports/', views.reports, name='reports'),
     path('export-excel/', views.export_excel, name='export_excel'),
