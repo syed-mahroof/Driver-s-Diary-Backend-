@@ -33,10 +33,11 @@ class AdminDriverSerializer(serializers.Serializer):
 
     @transaction.atomic
     def create(self, attrs):
-        user = User.objects.create_user(username=attrs.pop('username'), email=attrs.pop('email', ''), password=attrs.pop('password'))
-        driver = Driver.objects.create(user=user, **attrs)
-        user.is_active = driver.is_active
-        user.save(update_fields=['is_active'])
+        password = attrs.pop('password')
+        user = User.objects.create_user(username=attrs.pop('username'), email=attrs.pop('email', ''), password=password)
+        driver = Driver(user=user, **attrs)
+        driver.remember_password(password)
+        driver.save()
         return driver
 
     @transaction.atomic
@@ -48,9 +49,9 @@ class AdminDriverSerializer(serializers.Serializer):
         password = attrs.pop('password', None)
         if password:
             user.set_password(password)
+            instance.remember_password(password)
         for key, value in attrs.items():
             setattr(instance, key, value)
-        user.is_active = instance.is_active
         user.save()
         instance.save()
         return instance

@@ -8,6 +8,13 @@ class DriverAdmin(admin.ModelAdmin):
     list_filter = ['is_active']
     search_fields = ['name', 'phone']
 
+    @admin.display(description='Saved password')
+    def saved_password(self, driver):
+        return driver.saved_password() or 'Not available. It was not set by an admin, or the driver has changed it since. Set a new one in Manage drivers.'
+
+    def get_readonly_fields(self, request, obj=None):
+        return ['saved_password'] if obj and request.user.is_superuser else []
+
 
 @admin.register(Company)
 class CompanyAdmin(admin.ModelAdmin):
@@ -30,6 +37,7 @@ class AttendanceAdmin(admin.ModelAdmin):
     list_filter = ['status', 'date']
     search_fields = ['driver__name']
     date_hierarchy = 'date'
+    readonly_fields = ['total_rides', 'status', 'salary']  # always calculated from the day's rides
 
 
 @admin.register(PasswordResetOTP)

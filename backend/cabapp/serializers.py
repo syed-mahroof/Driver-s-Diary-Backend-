@@ -3,7 +3,7 @@ from django.contrib.auth.models import User
 from django.db import transaction
 from decimal import Decimal
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
-from .models import Driver, Company, Ride, Attendance, CarCharge, Vehicle, AdvanceSalaryRequest
+from .models import Driver, Company, Ride, CarCharge, Vehicle, AdvanceSalaryRequest
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -47,9 +47,6 @@ class RegisterSerializer(serializers.Serializer):
         if User.objects.filter(email__iexact=value).exists():
             raise serializers.ValidationError('An account with this email already exists.')
         return value
-
-    def validate(self, data):
-        return data
 
     @transaction.atomic
     def create(self, validated_data):
@@ -120,43 +117,6 @@ class SyncRideSerializer(serializers.Serializer):
 
 class SyncPayloadSerializer(serializers.Serializer):
     rides = SyncRideSerializer(many=True)
-
-
-class AttendanceSerializer(serializers.ModelSerializer):
-    driver_name = serializers.CharField(source='driver.name', read_only=True)
-
-    class Meta:
-        model = Attendance
-        fields = ['id', 'driver', 'driver_name', 'date', 'total_rides', 'status', 'salary']
-
-
-class DriverDashboardSerializer(serializers.Serializer):
-    driver_id = serializers.IntegerField()
-    driver_name = serializers.CharField()
-    today_rides = serializers.IntegerField()
-    target_rides = serializers.IntegerField()
-    status = serializers.CharField()
-    salary_today = serializers.DecimalField(max_digits=10, decimal_places=2)
-    progress_percentage = serializers.FloatField()
-    recent_rides = RideSerializer(many=True)
-    default_vehicle_number = serializers.CharField()
-    default_seater = serializers.IntegerField()
-
-
-class AdminDashboardSerializer(serializers.Serializer):
-    total_rides = serializers.IntegerField()
-    total_drivers = serializers.IntegerField()
-    total_half_days = serializers.IntegerField()
-    total_full_days = serializers.IntegerField()
-    total_salary_paid = serializers.DecimalField(max_digits=12, decimal_places=2)
-
-
-class ReportRowSerializer(serializers.Serializer):
-    driver_name = serializers.CharField()
-    date = serializers.DateField()
-    total_rides = serializers.IntegerField()
-    status = serializers.CharField()
-    salary = serializers.DecimalField(max_digits=10, decimal_places=2)
 
 
 class ForgotPasswordRequestSerializer(serializers.Serializer):

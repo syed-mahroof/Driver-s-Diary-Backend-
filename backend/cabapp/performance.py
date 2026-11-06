@@ -7,13 +7,13 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from .filters import admin_filters, scope_rides
 from .models import Driver, Ride, Attendance, CarCharge, AdvanceSalaryRequest
+from .views import (build_salary_cycle_summaries, get_current_and_previous_salary_cycles,
+                    SALARY_BASE_TRIP_VALUE, SALARY_SPECIAL_KM_RATE, SALARY_TARGET_AMOUNT, SPECIAL_COMPANY_Q)
 
 
 @api_view(['GET'])
 @permission_classes([IsAdminUser])
 def driver_performance(request):
-    from .views import (build_salary_cycle_summaries, get_current_and_previous_salary_cycles,
-                        SALARY_BASE_TRIP_VALUE, SALARY_SPECIAL_KM_RATE, SALARY_TARGET_AMOUNT)
     start, end, driver_ids, companies, vehicles = admin_filters(request.query_params)
     start = date.fromisoformat(start) if start else date.today().replace(day=1)
     end = date.fromisoformat(end) if end else date.today()
@@ -25,7 +25,7 @@ def driver_performance(request):
     drivers = list(drivers.order_by('name'))
     ids = [driver.pk for driver in drivers]
     rides = scope_rides(Ride.objects.filter(driver_id__in=ids), start, end, [], companies, vehicles)
-    special = Q(company__name__icontains='zellis') | Q(company__name__icontains='dodge')
+    special = SPECIAL_COMPANY_Q
     aggregates = {
         row['driver_id']: row for row in rides.order_by().values('driver_id').annotate(
             trips=Count('id'), active_days=Count('date', distinct=True), distance_km=Sum('total_km'),

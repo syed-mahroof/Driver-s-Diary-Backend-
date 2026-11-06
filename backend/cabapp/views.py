@@ -1,13 +1,39 @@
+import calendar
 from datetime import date, datetime, timedelta
-import random
+import logging
 import re
+import secrets
+
+from django.conf import settings
+from django.contrib.auth.models import User
+from django.core.mail import send_mail
 from django.db import transaction
 from django.db.models import Count, Sum, Q, Case, When, Value, IntegerField
 from django.http import HttpResponse
-from django.conf import settings
+from django.utils.html import escape
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from rest_framework import status
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
+from rest_framework.permissions import IsAuthenticated, IsAdminUser
+from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
+from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
 
-import calendar
+from .filters import admin_filters, scope_rides
+from .models import Driver, Company, Ride, Attendance, PasswordResetOTP, Vehicle, CarCharge, AdvanceSalaryRequest
+from .serializers import (
+    CompanySerializer, RideSerializer, RideCreateSerializer,
+    SyncPayloadSerializer, DriverSerializer,
+    RegisterSerializer, UserSerializer, CabTokenObtainPairSerializer,
+    ForgotPasswordRequestSerializer, VerifyOTPSerializer, ResetPasswordSerializer,
+    CarChargeSerializer, VehicleSerializer, AdvanceSalaryRequestSerializer,
+)
+
+logger = logging.getLogger(__name__)
+
 
 def get_trailing_month_range(year, month):
     """Salary cycle ending on the 15th of (year, month): runs 16th of the
@@ -38,6 +64,8 @@ SALARY_TARGET_AMOUNT = 20000
 SALARY_BASE_TRIP_VALUE = SALARY_TARGET_AMOUNT / SALARY_TARGET_TRIPS
 SALARY_INCENTIVE_TRIP_VALUE = 200
 SALARY_SPECIAL_KM_RATE = 3.5
+# Zellis and Dodge rides are paid by distance instead of per trip.
+SPECIAL_COMPANY_Q = Q(company__name__icontains='zellis') | Q(company__name__icontains='dodge')
 
 
 def get_current_and_previous_salary_cycles(ref_date=None):
@@ -59,11 +87,6 @@ def build_salary_cycle_summaries(drivers, cycle_start, cycle_end):
     if not driver_ids:
         return {}
 
-    special_company_q = (
-        Q(company__name__icontains='zellis') |
-        Q(company__name__icontains='dodge')
-    )
-
     ride_data = {
         row['driver_id']: row
         for row in Ride.objects.filter(
@@ -72,8 +95,8 @@ def build_salary_cycle_summaries(drivers, cycle_start, cycle_end):
             date__lte=cycle_end,
         ).values('driver_id').annotate(
             total_rides=Count('id'),
-            standard_rides=Count('id', filter=~special_company_q),
-            special_kms=Sum('total_km', filter=special_company_q),
+            standard_rides=Count('id', filter=~SPECIAL_COMPANY_Q),
+            special_kms=Sum('total_km', filter=SPECIAL_COMPANY_Q),
         )
     }
 
@@ -185,39 +208,20 @@ def dedupe_ride_list(rides):
     return unique
 
 
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated, IsAdminUser
-from rest_framework.response import Response
-from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
-from django.core.mail import send_mail
-
-import openpyxl
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
-
-from .models import Driver, Company, Ride, Attendance, PasswordResetOTP, Vehicle, CarCharge, AdvanceSalaryRequest
-from .filters import admin_filters
-from .serializers import (
-    CompanySerializer, RideSerializer, RideCreateSerializer,
-    SyncPayloadSerializer, DriverSerializer,
-    RegisterSerializer, UserSerializer, CabTokenObtainPairSerializer,
-    ForgotPasswordRequestSerializer, VerifyOTPSerializer, ResetPasswordSerializer,
-    CarChargeSerializer, VehicleSerializer, AdvanceSalaryRequestSerializer,
-)
+class LoginThrottle(AnonRateThrottle):
+    scope = 'login'
+    rate = '30/minute'
 
 
-def update_attendance(driver, ride_date):
-    """Recalculate attendance for a driver on a given date."""
-    total = Ride.objects.filter(driver=driver, date=ride_date).count()
-    attendance, _ = Attendance.objects.get_or_create(driver=driver, date=ride_date)
-    attendance.total_rides = total
-    attendance.save()
-    return attendance
+class OTPThrottle(AnonRateThrottle):
+    """A 6-digit OTP can be brute-forced without this."""
+    scope = 'otp'
+    rate = '20/hour'
 
 
 class CabTokenObtainPairView(TokenObtainPairView):
     serializer_class = CabTokenObtainPairSerializer
+    throttle_classes = [LoginThrottle]
 
 
 @api_view(['POST'])
@@ -236,34 +240,27 @@ def register(request):
 
 
 def _find_user_by_contact(contact):
-    """Find a user by email or phone number."""
-    contact = contact.strip()
-    # Try email first
-    try:
-        from django.contrib.auth.models import User
-        user = User.objects.get(email__iexact=contact)
-        return user
-    except User.DoesNotExist:
-        pass
-    # Try phone number via Driver model
-    try:
-        driver = Driver.objects.get(phone=contact)
-        return driver.user
-    except Driver.DoesNotExist:
-        pass
-    return None
+    return User.objects.filter(email__iexact=contact.strip()).order_by('pk').first()
+
+
+def _mask_email(email):
+    name, _, domain = email.partition('@')
+    return f"{name[0]}***{name[-1] if len(name) > 1 else ''}@{domain}"
 
 
 @api_view(['POST'])
 @permission_classes([])
+@throttle_classes([OTPThrottle])
 def forgot_password(request):
     serializer = ForgotPasswordRequestSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-    contact = serializer.validated_data['contact']
-    user = _find_user_by_contact(contact)
+    contact = serializer.validated_data['contact'].strip()
+    if '@' not in contact or not contact.split('@')[0]:
+        return Response({'error': 'Enter your registered email address.'}, status=status.HTTP_400_BAD_REQUEST)
 
+    user = _find_user_by_contact(contact)
     if not user:
         return Response(
             {'error': 'No account found with this email address.'},
@@ -273,76 +270,43 @@ def forgot_password(request):
     # Invalidate any existing unused OTPs for this user
     PasswordResetOTP.objects.filter(user=user, is_used=False).update(is_used=True)
 
-    # Generate 6-digit OTP
-    otp_code = f"{random.randint(100000, 999999)}"
+    otp_code = f"{secrets.randbelow(900000) + 100000}"
     PasswordResetOTP.objects.create(user=user, otp=otp_code)
 
-    # Determine which method was used
-    is_email = '@' in contact
-    masked = _mask_contact(contact, is_email)
-
-    if is_email:
-        subject = "Driver's Diary - Password Reset OTP"
-        message = f"Hello {user.username},\n\nYour OTP for password reset is: {otp_code}\n\nPlease do not share this OTP with anyone.\n\nThank you,\nDriver's Diary Team"
-        html_message = f"""
-        <html>
-            <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-                <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
-                    <h2 style="color: #2E7D32; text-align: center;">Driver's Diary</h2>
-                    <p>Hello <strong>{user.username}</strong>,</p>
-                    <p>We received a request to reset your password. Your One-Time Password (OTP) is:</p>
-                    <div style="background-color: #f4f4f4; padding: 15px; text-align: center; font-size: 24px; letter-spacing: 5px; font-weight: bold; border-radius: 5px; margin: 20px 0;">
-                        {otp_code}
-                    </div>
-                    <p style="color: #d32f2f; font-size: 0.9em;">Please do not share this OTP with anyone. It is valid for a limited time.</p>
-                    <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
-                    <p style="font-size: 0.8em; color: #777;">Thank you,<br>Driver's Diary Team</p>
+    message = f"Hello {user.username},\n\nYour OTP for password reset is: {otp_code}\n\nPlease do not share this OTP with anyone.\n\nThank you,\nDriver's Diary Team"
+    html_message = f'''
+    <html>
+        <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+            <div style="max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 8px;">
+                <h2 style="color: #2E7D32; text-align: center;">Driver's Diary</h2>
+                <p>Hello <strong>{escape(user.username)}</strong>,</p>
+                <p>We received a request to reset your password. Your One-Time Password (OTP) is:</p>
+                <div style="background-color: #f4f4f4; padding: 15px; text-align: center; font-size: 24px; letter-spacing: 5px; font-weight: bold; border-radius: 5px; margin: 20px 0;">
+                    {otp_code}
                 </div>
-            </body>
-        </html>
-        """
-        try:
-            send_mail(
-                subject,
-                message,
-                settings.DEFAULT_FROM_EMAIL if hasattr(settings, 'DEFAULT_FROM_EMAIL') else 'noreply@driversdiary.com',
-                [contact],
-                fail_silently=False,
-                html_message=html_message
-            )
-        except Exception as e:
-            print(f"Error sending email: {e}")
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {'error': f'Failed to send email. Error: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
-    else:
-        # If it's a phone number, logic for sending SMS would go here.
-        # Since the user requested to send to email, and the form now only accepts email, 
-        # this path is unlikely, but we keep it for fallback.
-        print(f"  PASSWORD RESET OTP for {user.username}: {otp_code}")
+                <p style="color: #d32f2f; font-size: 0.9em;">Please do not share this OTP with anyone. It is valid for 10 minutes.</p>
+                <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
+                <p style="font-size: 0.8em; color: #777;">Thank you,<br>Driver's Diary Team</p>
+            </div>
+        </body>
+    </html>
+    '''
+    try:
+        send_mail("Driver's Diary - Password Reset OTP", message, settings.DEFAULT_FROM_EMAIL, [user.email],
+                  fail_silently=False, html_message=html_message)
+    except Exception:
+        logger.exception('Could not send password reset email')
+        return Response(
+            {'error': 'Could not send the email right now. Please try again later.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
 
-    return Response({
-        'message': f'OTP sent to {masked}',
-        'contact_type': 'email' if is_email else 'phone',
-    })
-
-
-def _mask_contact(contact, is_email):
-    """Mask contact info for privacy."""
-    if is_email:
-        parts = contact.split('@')
-        name = parts[0]
-        masked_name = name[0] + '***' + (name[-1] if len(name) > 1 else '')
-        return f"{masked_name}@{parts[1]}"
-    else:
-        return contact[:2] + '****' + contact[-2:] if len(contact) > 4 else '****'
+    return Response({'message': f'OTP sent to {_mask_email(contact)}'})
 
 
 @api_view(['POST'])
 @permission_classes([])
+@throttle_classes([OTPThrottle])
 def verify_otp(request):
     serializer = VerifyOTPSerializer(data=request.data)
     if not serializer.is_valid():
@@ -364,6 +328,7 @@ def verify_otp(request):
 
 @api_view(['POST'])
 @permission_classes([])
+@throttle_classes([OTPThrottle])
 def reset_password(request):
     serializer = ResetPasswordSerializer(data=request.data)
     if not serializer.is_valid():
@@ -403,47 +368,25 @@ def driver_dashboard(request):
     full_rate = getattr(settings, 'FULL_DAY_RATE', 1000)
     half_rate = getattr(settings, 'HALF_DAY_RATE', 500)
 
-    # Q filter: rides linked to Zellis or Dodge are billed by distance @ Rs 3.5/km
-    special_company_q = (
-        Q(company__name__icontains='zellis') |
-        Q(company__name__icontains='dodge')
+    cycle_end_year, cycle_end_month = get_cycle_end_year_month(today)
+    salary_start, salary_end = get_trailing_month_range(cycle_end_year, cycle_end_month)
+    is_today = Q(date=today)
+    totals = Ride.objects.filter(driver=driver, date__gte=salary_start, date__lte=salary_end).aggregate(
+        today_rides=Count('id', filter=is_today),
+        today_standard=Count('id', filter=is_today & ~SPECIAL_COMPANY_Q),
+        today_kms=Sum('total_km', filter=is_today & SPECIAL_COMPANY_Q),
+        monthly_standard=Count('id', filter=~SPECIAL_COMPANY_Q),
+        monthly_kms=Sum('total_km', filter=SPECIAL_COMPANY_Q),
     )
-
-    today_rides_qs = Ride.objects.filter(driver=driver, date=today)
-    today_count = today_rides_qs.count()
+    today_count = totals['today_rides']
 
     is_full = today_count >= threshold
     current_salary = 0 if today.weekday() >= 5 or today_count == 0 else full_rate if is_full else half_rate
 
     recent_rides = RideSerializer(
-        today_rides_qs.select_related('company', 'driver').order_by('-created_at')[:10],
+        Ride.objects.filter(driver=driver, date=today).select_related('company', 'driver').order_by('-created_at')[:10],
         many=True
     ).data
-
-    # ── Daily earnings aggregates ────────────────────────────────────────────
-    today_standard_rides = today_rides_qs.exclude(special_company_q).count()
-    today_special_kms_agg = (
-        today_rides_qs
-        .filter(special_company_q)
-        .aggregate(total=Sum('total_km'))
-    )
-    today_special_kms = float(today_special_kms_agg['total'] or 0)
-
-    # ── Monthly earnings aggregates ──────────────────────────────────────────
-    cycle_end_year, cycle_end_month = get_cycle_end_year_month(today)
-    salary_start, salary_end = get_trailing_month_range(cycle_end_year, cycle_end_month)
-    month_rides_qs = Ride.objects.filter(
-        driver=driver,
-        date__gte=salary_start,
-        date__lte=salary_end,
-    )
-    monthly_standard_rides = month_rides_qs.exclude(special_company_q).count()
-    monthly_special_kms_agg = (
-        month_rides_qs
-        .filter(special_company_q)
-        .aggregate(total=Sum('total_km'))
-    )
-    monthly_special_kms = float(monthly_special_kms_agg['total'] or 0)
 
     attendance_qs = Attendance.objects.filter(
         driver=driver,
@@ -473,11 +416,10 @@ def driver_dashboard(request):
         'recent_rides': recent_rides,
         'default_vehicle_number': driver.default_vehicle_number,
         'default_seater': driver.default_seater,
-        # ── NEW: earnings engine aggregates ──────────────────────────────────
-        'today_standard_rides': today_standard_rides,
-        'today_special_kms': today_special_kms,
-        'monthly_standard_rides': monthly_standard_rides,
-        'monthly_special_kms': monthly_special_kms,
+        'today_standard_rides': totals['today_standard'],
+        'today_special_kms': float(totals['today_kms'] or 0),
+        'monthly_standard_rides': totals['monthly_standard'],
+        'monthly_special_kms': float(totals['monthly_kms'] or 0),
         'monthly_target': 120,
         'cycle_days_elapsed': cycle_days_elapsed,
         'cycle_start': salary_start.isoformat(),
@@ -531,7 +473,6 @@ def create_ride(request):
     serializer = RideCreateSerializer(data=request.data, context={'request': request})
     if serializer.is_valid():
         ride = serializer.save()
-        update_attendance(driver, ride.date)
         return Response(RideSerializer(ride).data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -547,19 +488,9 @@ def update_ride(request, pk):
     except Ride.DoesNotExist:
         return Response({'error': 'Ride not found'}, status=404)
 
-    old_date = ride.date
     serializer = RideCreateSerializer(ride, data=request.data, partial=True, context={'request': request})
     if serializer.is_valid():
-        updated_ride = serializer.save()
-
-        # Update attendance for the old date if it changed
-        if old_date != updated_ride.date:
-            update_attendance(driver, old_date)
-
-        # Always update attendance for the (new) date
-        update_attendance(driver, updated_ride.date)
-
-        return Response(RideSerializer(updated_ride).data)
+        return Response(RideSerializer(serializer.save()).data)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -573,7 +504,7 @@ def create_car_charge(request):
 
     serializer = CarChargeSerializer(data=request.data, context={'request': request})
     if serializer.is_valid():
-        charge = serializer.save()
+        serializer.save()
         return Response(serializer.data, status=status.HTTP_201_CREATED)
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -593,24 +524,22 @@ def sync_rides(request):
     rides_data = payload.validated_data['rides']
     results = {'synced': [], 'skipped': [], 'errors': []}
 
-    with transaction.atomic():
-        for ride_data in rides_data:
-            local_id = ride_data['local_id']
+    for ride_data in rides_data:
+        local_id = ride_data['local_id']
 
-            existing = Ride.objects.filter(local_id=local_id).first()
-            if existing:
-                if existing.driver_id == driver.pk:
-                    results['skipped'].append(local_id)
-                else:
-                    results['errors'].append({'local_id': local_id, 'error': 'Ride ID is unavailable.'})
-                continue
+        existing = Ride.objects.filter(local_id=local_id).first()
+        if existing:
+            if existing.driver_id == driver.pk:
+                results['skipped'].append(local_id)
+            else:
+                results['errors'].append({'local_id': local_id, 'error': 'Ride ID is unavailable.'})
+            continue
 
-            try:
-                company = None
-                if ride_data.get('company_id'):
-                    company = Company.objects.get(id=ride_data['company_id'])
-
-                ride = Ride.objects.create(
+        try:
+            # Own transaction: on PostgreSQL a failed insert would otherwise abort every later ride.
+            with transaction.atomic():
+                company = Company.objects.get(id=ride_data['company_id']) if ride_data.get('company_id') else None
+                Ride.objects.create(
                     local_id=local_id,
                     driver=driver,
                     company=company,
@@ -625,10 +554,12 @@ def sync_rides(request):
                     vehicle_number=ride_data.get('vehicle_number', ''),
                     requested_seater=ride_data.get('requested_seater', 4),
                 )
-                results['synced'].append(local_id)
-                update_attendance(driver, ride.date)
-            except Exception as e:
-                results['errors'].append({'local_id': local_id, 'error': str(e)})
+            results['synced'].append(local_id)
+        except Company.DoesNotExist:
+            results['errors'].append({'local_id': local_id, 'error': 'Selected company no longer exists.'})
+        except Exception:
+            logger.exception('Could not sync ride %s', local_id)
+            results['errors'].append({'local_id': local_id, 'error': 'Could not save this ride.'})
 
     return Response({
         'message': f"Sync complete. {len(results['synced'])} synced, {len(results['skipped'])} skipped.",
@@ -729,7 +660,9 @@ def admin_dashboard(request):
 
     # Company breakdown (deduped to avoid inflated counts from duplicate sync rows)
     company_breakdown_map = {}
-    unique_rides = dedupe_ride_list(list(ride_qs.select_related('company')))
+    unique_rides = dedupe_ride_list(list(ride_qs.select_related('company').only(
+        'driver_id', 'date', 'company', 'company__name', 'ride_time', 'trip_type', 'route', 'pickup', 'vehicle_number', 'total_km'
+    )))
     for ride in unique_rides:
         name = ride.company.name if ride.company else 'Other'
         if name not in company_breakdown_map:
@@ -850,7 +783,6 @@ def reports(request):
 
     start_date, end_date, driver_id, company_id, vehicle_number = admin_filters(request.query_params)
 
-    from .filters import scope_rides
     rides = scope_rides(Ride.objects.select_related('company', 'driver'), start_date, end_date, driver_id, company_id, vehicle_number)
     grouped = {}
     for ride in dedupe_ride_list(list(rides.order_by('-date', 'driver__name', 'ride_time', 'created_at'))):
@@ -914,8 +846,9 @@ def export_excel(request):
     if driver_id:
         target_drivers = list(Driver.objects.filter(id__in=driver_id))
     elif scoped_filters:
+        # Removed drivers keep their history, so their rides still belong in a scoped export.
         driver_ids = rides_scope.values_list('driver_id', flat=True).distinct()
-        target_drivers = list(Driver.objects.filter(id__in=driver_ids, is_active=True).order_by('name'))
+        target_drivers = list(Driver.objects.filter(id__in=driver_ids).order_by('name'))
     else:
         target_drivers = list(Driver.objects.filter(is_active=True).order_by('name'))
 
@@ -948,10 +881,6 @@ def export_excel(request):
     )
     if driver_id:
         advance_qs_all = advance_qs_all.filter(driver_id__in=driver_id)
-
-    full_rate = getattr(settings, 'FULL_DAY_RATE', 1000)
-    half_rate = getattr(settings, 'HALF_DAY_RATE', 500)
-    threshold = getattr(settings, 'FULL_DAY_THRESHOLD', 4)
 
     wb = openpyxl.Workbook()
 
@@ -1001,7 +930,7 @@ def export_excel(request):
             ws = wb.create_sheet(title=sheet_name)
 
         # Title
-        ws.merge_cells('A1:H1')
+        ws.merge_cells('A1:I1')
         title_cell = ws['A1']
         title_cell.value = f"Ride Manifest - {drv.name}"
         title_cell.font = Font(bold=True, size=13)
@@ -1076,7 +1005,6 @@ def export_excel(request):
         ws.cell(row=total_row, column=1, value='TOTAL RIDES').font = Font(bold=True)
         ws.cell(row=total_row, column=2, value=total_rides_count).font = Font(bold=True)
         if is_full_month(d_start, d_end):
-            salary_start, salary_end = get_trailing_month_range(d_end.year, d_end.month)
             total_salary = cycle_salary.get(drv.id, 0)
 
         ws.cell(row=total_row, column=7, value='TOTAL SALARY').font = Font(bold=True)
@@ -1218,17 +1146,7 @@ def export_excel(request):
             wsall.column_dimensions[get_column_letter(i)].width = width
 
     # Consolidated All Rides Sheet (all drivers, all rides in one sheet)
-    all_rides_qs = Ride.objects.select_related('company', 'driver').filter(
-        date__gte=d_start, date__lte=d_end
-    )
-    if driver_id:
-        all_rides_qs = all_rides_qs.filter(driver_id__in=driver_id)
-    if company_id:
-        all_rides_qs = all_rides_qs.filter(company_id__in=company_id)
-    if vehicle_number:
-        all_rides_qs = all_rides_qs.filter(vehicle_number__in=vehicle_number)
-
-    all_rides_list = dedupe_ride_list(list(all_rides_qs.annotate(
+    all_rides_list = dedupe_ride_list(list(rides_scope.select_related('company', 'driver').annotate(
         trip_type_order=Case(
             When(trip_type='P', then=Value(0)),
             When(trip_type='D', then=Value(1)),
@@ -1292,9 +1210,10 @@ def export_excel(request):
             wsr.column_dimensions[get_column_letter(i)].width = width
 
     if not target_drivers:
-        ws = wb.active
+        # Still the workbook's untouched default sheet; the consolidated sheets were inserted before it.
+        ws = wb['Sheet']
         ws.title = 'Report'
-        ws['A1'] = 'No data found for the selected filters.'
+        ws['A1'] = 'No driver data found for the selected filters.'
 
     filename = f"ride_manifest"
     if start_date_str:
@@ -1328,25 +1247,23 @@ def export_monthly_report(request):
     except (TypeError, ValueError):
         return Response({'error': 'Invalid month or year'}, status=400)
 
-    import calendar
-
     _, last_day = calendar.monthrange(year, month)
     start_date = date(year, month, 1)
     end_date = date(year, month, last_day)
 
-    # Find companies that have rides in this period, and all active companies
-    company_ids = Ride.objects.filter(
+    rides = dedupe_ride_list(list(Ride.objects.select_related('company', 'driver').filter(
         date__gte=start_date, date__lte=end_date
-    ).values_list('company_id', flat=True).distinct()
-    
-    companies_with_rides = Company.objects.filter(id__in=company_ids)
-    active_companies = Company.objects.filter(is_active=True)
-    companies = (companies_with_rides | active_companies).distinct().order_by('name')
-
-    # Also check if there are any rides with no company (company=None)
-    has_unassigned = Ride.objects.filter(
-        date__gte=start_date, date__lte=end_date, company__isnull=True
-    ).exists()
+    ).annotate(
+        trip_type_order=Case(
+            When(trip_type='P', then=Value(0)),
+            When(trip_type='D', then=Value(1)),
+            default=Value(2),
+            output_field=IntegerField(),
+        )
+    ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at')))
+    rides_by_company = {}
+    for ride in rides:
+        rides_by_company.setdefault(ride.company.name if ride.company else 'Other', []).append(ride)
 
     wb = openpyxl.Workbook()
     # Remove default sheet to start clean
@@ -1373,7 +1290,7 @@ def export_monthly_report(request):
         # Merge A1:H1 for title banner
         ws.merge_cells('A1:H1')
         title_cell = ws['A1']
-        title_cell.value = "Consolidated Rides - All Drivers"
+        title_cell.value = f"{title} Rides - All Drivers"
         title_cell.font = Font(bold=True, size=14, color='FFFFFF')
         title_cell.fill = rides_fill
         title_cell.alignment = center_align
@@ -1418,50 +1335,10 @@ def export_monthly_report(request):
 
     used_titles = set()
 
-    # Create sheets for each company
-    for comp in companies:
-        rides_qs = Ride.objects.select_related('company', 'driver').filter(
-            company=comp,
-            date__gte=start_date,
-            date__lte=end_date
-        )
-        rides_list = list(rides_qs.annotate(
-            trip_type_order=Case(
-                When(trip_type='P', then=Value(0)),
-                When(trip_type='D', then=Value(1)),
-                default=Value(2),
-                output_field=IntegerField(),
-            )
-        ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
-
-        # Only create sheet if there are rides
-        if not rides_list:
-            continue
-
-        sheet_title = make_unique_sheet_title(comp.name, used_titles, fallback='Company')
-        ws = wb.create_sheet(title=sheet_title)
-        populate_sheet(ws, comp.name, rides_list)
-
-    # Handle unassigned company rides if any
-    if has_unassigned:
-        rides_qs = Ride.objects.select_related('company', 'driver').filter(
-            company__isnull=True,
-            date__gte=start_date,
-            date__lte=end_date
-        )
-        rides_list = list(rides_qs.annotate(
-            trip_type_order=Case(
-                When(trip_type='P', then=Value(0)),
-                When(trip_type='D', then=Value(1)),
-                default=Value(2),
-                output_field=IntegerField(),
-            )
-        ).order_by('date', 'trip_type_order', 'ride_time', 'driver__name', 'created_at'))
-
-        if rides_list:
-            sheet_title = make_unique_sheet_title("Other", used_titles, fallback='Other')
-            ws = wb.create_sheet(title=sheet_title)
-            populate_sheet(ws, "Other", rides_list)
+    # 'Other' (rides with no company) goes last.
+    for company_name in sorted(rides_by_company, key=lambda name: (name == 'Other', name.lower())):
+        sheet_title = make_unique_sheet_title(company_name, used_titles, fallback='Company')
+        populate_sheet(wb.create_sheet(title=sheet_title), company_name, rides_by_company[company_name])
 
     # Fallback if no sheets were created
     if len(wb.sheetnames) == 0:
@@ -1512,7 +1389,7 @@ def export_driver_excel(request):
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"{driver.name[:20]}_{period_str}"
+    ws.title = make_unique_sheet_title(f"{driver.name[:20]}_{period_str}", set(), fallback=period_str)
 
     header_fill = PatternFill(start_color='1F3A5F', end_color='1F3A5F', fill_type='solid')
     header_font = Font(bold=True, color='FFFFFF', size=11)
@@ -1541,10 +1418,14 @@ def export_driver_excel(request):
     total_salary = 0
     row_idx = 3
     attendances = list(qs)
-    
-    for att in attendances:
-        rides = list(Ride.objects.select_related('company').filter(driver=driver, date=att.date).order_by('ride_time', 'created_at')) or [None]
+    full_fill = PatternFill(start_color='E8F5E9', end_color='E8F5E9', fill_type='solid')
+    other_fill = PatternFill(start_color='FFF9C4', end_color='FFF9C4', fill_type='solid')
+    rides_by_date = {}
+    for ride in Ride.objects.select_related('company').filter(driver=driver, date__in=[att.date for att in attendances]).order_by('ride_time', 'created_at'):
+        rides_by_date.setdefault(ride.date, []).append(ride)
 
+    for att in attendances:
+        rides = rides_by_date.get(att.date) or [None]
         for ride_number, ride in enumerate(rides, 1):
             if ride:
                 route = ride.route or f"{ride.pickup} to {ride.drop}"
@@ -1566,10 +1447,7 @@ def export_driver_excel(request):
                 cell = ws.cell(row=row_idx, column=col, value=val)
                 cell.alignment = center_align if col not in (6, 7) else Alignment(horizontal='left')
                 cell.border = border
-                if att.status == 'Full':
-                    cell.fill = PatternFill(start_color='E8F5E9', end_color='E8F5E9', fill_type='solid')
-                else:
-                    cell.fill = PatternFill(start_color='FFF9C4', end_color='FFF9C4', fill_type='solid')
+                cell.fill = full_fill if att.status == 'Full' else other_fill
             row_idx += 1
         total_salary += float(att.salary)
 
@@ -1593,7 +1471,7 @@ def export_driver_excel(request):
         ws = wb.active
         ws['A1'] = f"No rides found for {period_str}."
 
-    filename = f"{driver.name.replace(' ', '_')}_Report_{period_str}.xlsx"
+    filename = f"{re.sub(r'[^\w-]+', '_', driver.name)}_Report_{period_str}.xlsx"
 
     response = HttpResponse(
         content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
@@ -1680,12 +1558,14 @@ def update_default_vehicle(request):
     except Driver.DoesNotExist:
         return Response({'error': 'Driver profile not found'}, status=404)
 
-    number = request.data.get('default_vehicle_number', '')
+    number = str(request.data.get('default_vehicle_number', ''))
     seater = request.data.get('default_seater', 4)
+    if str(seater) not in ('4', '6') or len(number) > 50:
+        return Response({'error': 'Choose a valid vehicle and seater type.'}, status=status.HTTP_400_BAD_REQUEST)
 
     driver.default_vehicle_number = number
-    driver.default_seater = seater
-    driver.save()
+    driver.default_seater = int(seater)
+    driver.save(update_fields=['default_vehicle_number', 'default_seater'])
 
     return Response({'message': 'Default vehicle updated successfully'})
 

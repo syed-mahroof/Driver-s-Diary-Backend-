@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from .models import Driver, Ride, CarCharge
 from .serializers import DriverSerializer, RideSerializer, AdvanceSalaryRequestSerializer
 from .admin_serializers import AdminDriverSerializer, AdminRideSerializer, AdminChargeSerializer, AdminAdvanceSerializer
+from .views import ride_dedupe_key
 
 
 def log_action(user, obj, action, message):
@@ -37,8 +38,6 @@ def driver_detail(request, pk):
         return Response({'error': 'Admin accounts cannot be changed through driver management.'}, status=400)
     if request.method == 'DELETE':
         driver.is_active = False
-        driver.user.is_active = False
-        driver.user.save(update_fields=['is_active'])
         driver.save(update_fields=['is_active'])
         log_action(request.user, driver, DELETION, 'Driver removed; login disabled and financial history retained.')
         return Response(status=204)
@@ -49,23 +48,28 @@ def driver_detail(request, pk):
     return Response(DriverSerializer(driver).data)
 
 
-@api_view(['POST', 'PATCH'])
+@api_view(['POST', 'PATCH', 'DELETE'])
 @permission_classes([IsAdminUser])
 @transaction.atomic
 def ride_detail(request, pk=None):
-    from .views import update_attendance
-    if request.method != ('POST' if pk is None else 'PATCH'):
+    if (pk is None) != (request.method == 'POST'):
         return Response(status=405)
-    ride = get_object_or_404(Ride.objects.select_for_update(), pk=pk) if pk is not None else None
-    old = (ride.driver, ride.date) if ride else None
-    serializer = AdminRideSerializer(ride, data=request.data, partial=bool(ride))
+    ride = get_object_or_404(Ride.objects.select_related('driver').select_for_update(of=('self',)), pk=pk) if pk is not None else None
+    if request.method == 'DELETE':
+        # The manifest collapses identical rows into one, so remove them together;
+        # otherwise a hidden duplicate would reappear as the "deleted" ride.
+        key = ride_dedupe_key(ride)
+        log_action(request.user, ride, DELETION, 'Deleted ride.')
+        for same_day_ride in Ride.objects.filter(driver_id=ride.driver_id, date=ride.date):
+            if ride_dedupe_key(same_day_ride) == key:
+                same_day_ride.delete()
+        return Response(status=204)
+    existing = ride is not None
+    serializer = AdminRideSerializer(ride, data=request.data, partial=existing)
     serializer.is_valid(raise_exception=True)
-    ride = serializer.save(**({} if ride else {'local_id': 'admin-' + str(uuid4())}))
-    if old and old != (ride.driver, ride.date):
-        update_attendance(*old)
-    update_attendance(ride.driver, ride.date)
-    log_action(request.user, ride, CHANGE if old else ADDITION, 'Recorded ride on behalf of driver.')
-    return Response(RideSerializer(ride).data, status=200 if old else 201)
+    ride = serializer.save(**({} if existing else {'local_id': 'admin-' + str(uuid4())}))
+    log_action(request.user, ride, CHANGE if existing else ADDITION, 'Recorded ride on behalf of driver.')
+    return Response(RideSerializer(ride).data, status=200 if existing else 201)
 
 
 @api_view(['POST', 'PATCH'])
