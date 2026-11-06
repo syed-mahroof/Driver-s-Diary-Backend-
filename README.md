@@ -15,6 +15,7 @@ All new mutation and performance endpoints require an authenticated staff admin.
 | POST | `admin/drivers/create/` | Create a driver with phone or email |
 | PATCH | `admin/drivers/<id>/` | Edit profile, login, default vehicle or active status |
 | DELETE | `admin/drivers/<id>/` | Disable login and retain historical records |
+| DELETE | `admin/rides/<id>/` | Delete a ride and its identical duplicates; attendance updates automatically |
 | GET | `admin/performance/` | Driver activity, daily trend and salary-cycle metrics |
 
 For paid advances, `paid_date` controls `resolved_date` and the salary cycle that deducts the payment. Pending requests never reduce net payable. Amounts must be positive finite decimals. Driver-supplied advance requests always remain pending until an admin resolves them.
@@ -24,6 +25,10 @@ For paid advances, `paid_date` controls `resolved_date` and the salary cycle tha
 Dashboard, reports and Excel accept CSV or repeated `driver_id`, `company_id` and `vehicle_number` values. Existing scalar filters remain supported. Dates use `YYYY-MM-DD`; invalid IDs, malformed dates and reversed ranges return HTTP 400. Performance accepts up to 366 days, defaults to month-to-date, and uses elapsed calendar days for average trips/day. Salary-cycle metrics include the driver's full cycle regardless of company/vehicle filters.
 
 Reports and Excel batch data instead of querying each driver/day. Performance query count remains constant as the number of drivers increases. Existing salary rules are preserved.
+
+## Saved driver passwords
+
+Passwords an admin sets for a driver (in Manage drivers) are kept so a superuser can read them on the Django admin Driver page if the driver forgets. No key or setup is needed. They are stored as plain text, so anyone with database access can read them; keep superuser and database access limited. A saved password is hidden once the driver changes it, and it never appears in the API.
 
 ## Isolated verification
 

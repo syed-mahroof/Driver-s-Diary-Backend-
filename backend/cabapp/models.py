@@ -1,19 +1,9 @@
-import base64
-import hashlib
-
-from cryptography.fernet import Fernet, InvalidToken
 from django.db import models
 from django.contrib.auth.models import User
 from django.conf import settings
 from django.db.models.signals import pre_save, post_save, post_delete
 from django.dispatch import receiver
 from django.utils import timezone
-
-
-def _password_cipher():
-    # The key lives outside the database, so a leaked backup alone can't reveal saved passwords.
-    digest = hashlib.sha256(f'driver-saved-password:{settings.SECRET_KEY}'.encode()).digest()
-    return Fernet(base64.urlsafe_b64encode(digest))
 
 
 class Driver(models.Model):
@@ -23,25 +13,21 @@ class Driver(models.Model):
     is_active = models.BooleanField(default=True)
     default_vehicle_number = models.CharField(max_length=50, blank=True, default='')
     default_seater = models.IntegerField(default=4)
-    # Encrypted copy of a password set by an admin, so it can be shared if the driver forgets it.
-    saved_password_encrypted = models.TextField(blank=True, default='', editable=False)
+    # Copy of a password an admin set, so it can be shared if the driver forgets it.
+    # Plain text by design (no key to manage): anyone with database access can read it.
+    admin_set_password = models.TextField(blank=True, default='', editable=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return self.name
 
     def remember_password(self, raw_password):
-        self.saved_password_encrypted = _password_cipher().encrypt(raw_password.encode()).decode()
+        self.admin_set_password = raw_password
 
     def saved_password(self):
         """The admin-set password, or None if there isn't one or it no longer logs in."""
-        if not self.saved_password_encrypted:
-            return None
-        try:
-            password = _password_cipher().decrypt(self.saved_password_encrypted.encode()).decode()
-        except InvalidToken:  # e.g. SECRET_KEY was changed
-            return None
-        return password if self.user.check_password(password) else None
+        password = self.admin_set_password
+        return password if password and self.user.check_password(password) else None
 
     class Meta:
         ordering = ['name']

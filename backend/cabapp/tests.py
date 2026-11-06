@@ -10,7 +10,7 @@ from django.contrib.auth.models import Permission, User
 from django.core import mail
 from django.core.cache import cache
 from django.db import connection
-from django.test import Client
+from django.test import Client, override_settings
 from django.test.utils import CaptureQueriesContext
 from rest_framework.test import APITestCase
 from .models import Driver, Company, Vehicle, Ride, Attendance, CarCharge, AdvanceSalaryRequest
@@ -406,11 +406,9 @@ class SavedDriverPasswordTests(APITestCase):
         client.force_login(user)
         return client.get(f'/admin/cabapp/driver/{driver.pk}/change/').content.decode()
 
-    def test_password_is_encrypted_at_rest_and_never_returned_by_the_api(self):
+    def test_password_is_saved_without_any_key_and_never_returned_by_the_api(self):
         driver, response = self.create_driver()
         self.assertEqual(driver.saved_password(), 'secret123')
-        self.assertTrue(driver.saved_password_encrypted)
-        self.assertNotIn('secret123', driver.saved_password_encrypted)
         self.assertNotIn('secret123', str(response.data))
         self.assertNotIn('secret123', str(self.client.get('/api/admin/drivers/').data))
         self.assertNotIn('saved_password', str(self.client.get('/api/admin/drivers/').data))
@@ -438,12 +436,15 @@ class SavedDriverPasswordTests(APITestCase):
         self.assertIsNone(driver.saved_password())
         self.assertNotIn('secret123', self.admin_page(self.superuser, driver))
 
-    def test_unreadable_or_missing_saved_copy_does_not_crash(self):
+    def test_saved_copy_does_not_depend_on_secret_key(self):
+        driver, _ = self.create_driver()
+        with override_settings(SECRET_KEY='a-completely-different-secret-key-for-this-test'):
+            self.assertEqual(Driver.objects.get(pk=driver.pk).saved_password(), 'secret123')
+
+    def test_missing_saved_copy_does_not_crash(self):
         driver = Driver.objects.create(user=User.objects.create_user('old', password='old-pass'), name='Old')
         self.assertIsNone(driver.saved_password())
         self.assertIn('Not available', self.admin_page(self.superuser, driver))
-        driver.saved_password_encrypted = 'not-a-valid-token'
-        self.assertIsNone(driver.saved_password())
 
 
 class RegressionTests(APITestCase):

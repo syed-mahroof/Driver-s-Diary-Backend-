@@ -1471,7 +1471,8 @@ def export_driver_excel(request):
         ws = wb.active
         ws['A1'] = f"No rides found for {period_str}."
 
-    filename = f"{re.sub(r'[^\w-]+', '_', driver.name)}_Report_{period_str}.xlsx"
+    safe_driver_name = re.sub(r'[^\w-]+', '_', driver.name)
+    filename = f"{safe_driver_name}_Report_{period_str}.xlsx"
 
     response = HttpResponse(
         content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
